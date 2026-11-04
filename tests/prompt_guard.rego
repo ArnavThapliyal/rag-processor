@@ -1,10 +1,12 @@
 package rag.prompt_guard
 
+import rego.v1
+
 # Default allow unless a violation is found
-default is_safe = true
+default is_safe := true
 
 # Block if the prompt contains known injection phrases
-is_safe = false {
+is_safe = false if {
     banned_words := [
         "ignore all previous instructions", 
         "system prompt", 
