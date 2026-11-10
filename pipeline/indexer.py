@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from config.settings import RAW_DOCUMENTS, RAW_NUMERIC, TRANS_NUMERIC, TRANS_DOCUMENTS, CLEANED_NUMERIC, CLEANED_DOCUMENTS, CHUNKED, DONE
-from pipeline.type_router import route_file
+from pipeline.type_router import HANDLER_DOCUMENT, open_routed
 from pipeline.parser import Parser
 from pipeline.cleaner import Cleaner
 from pipeline.chunker import Chunker
@@ -72,43 +72,45 @@ class Indexer:
         chunks_written = 0
 
         for file_path in sorted(raw_dir.iterdir()):
-            # manifest.json is document_crawler's own bookkeeping, not a document.
+            # manifest.json is batch bookkeeping (optional url map), not a document.
             if not file_path.is_file() or file_path.name == "manifest.json":
                 continue
 
-            routed = route_file(str(file_path), scratch_dir)
-            if not routed:
-                files_skipped += 1
-                continue
-
-            for handler, resolved_path in routed:
-                if handler != "structured_doc_handler":
-                    # tabular_handler (xlsx/csv filings) — [DEFERRED], no
-                    # numeric-style consumer wired in yet. Recorded via the
-                    # skip counter, not silently dropped.
+            # Zip members stay on disk until this with-block exits, i.e. until they are indexed.
+            with open_routed(file_path, scratch_dir) as routed:
+                if not routed:
                     files_skipped += 1
                     continue
 
-                # Fetch the URL for this specific file from our map
-                source_url = url_map.get(file_path.name, "")
+                for item in routed:
+                    if item.handler != HANDLER_DOCUMENT:
+                        # Tabular files are routed but not yet wired into the index
+                        # (Step 6); unsupported ones carry item.reason. Both are counted.
+                        if item.reason:
+                            logger.info(f"[indexer] [{symbol}] skipping {item.display_name}: {item.reason}")
+                        files_skipped += 1
+                        continue
 
-                try:
-                    n = self._index_file(
-                        Path(resolved_path), 
-                        symbol, 
-                        source_filename=file_path.name,
-                        source_url=source_url
-                    )
-                except Exception as exc:
-                    logger.warning(f"[indexer] [{symbol}] failed on {resolved_path}: {exc}", exc_info=True)
-                    files_failed += 1
-                    continue
+                    # Fetch the URL for this specific file from our map
+                    source_url = url_map.get(file_path.name, "")
 
-                if n == 0:
-                    files_failed += 1
-                else:
-                    files_indexed += 1
-                    chunks_written += n
+                    try:
+                        n = self._index_file(
+                            item.path,
+                            symbol,
+                            source_filename=item.display_name,
+                            source_url=source_url
+                        )
+                    except Exception as exc:
+                        logger.warning(f"[indexer] [{symbol}] failed on {item.display_name}: {exc}", exc_info=True)
+                        files_failed += 1
+                        continue
+
+                    if n == 0:
+                        files_failed += 1
+                    else:
+                        files_indexed += 1
+                        chunks_written += n
 
         if files_indexed == 0:
             return {
@@ -127,11 +129,10 @@ class Indexer:
         }
 
     def _index_file(self, file_path: Path, symbol: str, source_filename: str, source_url: str = "") -> int:
-        # Define the scratch directory (adjust the path if you want it stored elsewhere)
-        scratch_dir = str(file_path.parent / "scratch")
-        # Ensure the directory actually exists before the parser tries to use it
-        os.makedirs(scratch_dir, exist_ok=True)
-        ir_blocks: list[dict[Any, Any]] = self._parser.run(str(file_path), scratch_dir)
+        result = self._parser.parse(file_path)
+        for warning in result.warnings:
+            logger.warning(f"[indexer] [{symbol}] {source_filename}: {warning}")
+        ir_blocks: list[dict[Any, Any]] = [b.to_dict() for b in result.blocks]  # dict form for the old cleaner (Step 4)
         if not ir_blocks:
             return 0
 

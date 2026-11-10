@@ -1,54 +1,44 @@
 #!/usr/bin/env python3
 """
-Entry point for the data harvester pipeline.
+Entry point for the RAG processor: ingest purchased files into LanceDB.
 
-Exactly three supported invocations — nothing else:
+    main.py                          # every unit under the default input dir
+    main.py --input /path/to/batch   # a different input dir
+    main.py --unit VENDOR_A --unit B # only the named units
 
-    main.py --all-symbols                  # every symbol, every stage
-    main.py --symbol SYM                   # one symbol, every stage
-    main.py --symbol SYM --stage STAGE     # one symbol, exactly one stage
-
---stage is only valid alongside --symbol; there is no "all symbols, one
-stage" mode in this pass. Add it deliberately later if you need it — don't
-let it appear as an accidental side effect of argparse defaults.
-
-Symbol source of truth: config/company_urls.json (produced by
-scripts/url_discovery.py). A symbol must have an entry there before it can
-be processed — that's what --all-symbols enumerates, and what --symbol is
-validated against.
+Input layout: each immediate subdirectory of the input dir is one unit
+(a batch of files from one vendor, company, etc.). If the input dir has no
+subdirectories it is treated as a single unit.
 """
 
 import sys
-import json
 import time
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
-from config.settings import COMPANY_URLS_JSON
-from pipeline.pipeline import PipelineRunner, STAGE_ORDER
+from config.settings import INPUT_DIR, LOG_DIR, ensure_dirs
+from pipeline.pipeline import PipelineRunner
 
 logger = logging.getLogger(__name__)
+
+# Directories inside an input dir that are working space, not input units.
+_RESERVED_DIRS = {"scratch"}
 
 
 def setup_logging() -> None:
     """
-    Configure the ROOT logger once, in one place.
-
-    Every module's `logging.getLogger(__name__)` — main.py, pipeline.py, and
-    every stage module — propagates up to root by default, so attaching
-    handlers here (via basicConfig) is enough for all of them. The previous
-    version attached handlers to logging.getLogger("__main__") specifically,
-    which pipeline.py's logger never propagated into — its INFO-level logs
-    were silently going nowhere.
+    Configure the ROOT logger once, in one place. Every module's
+    `logging.getLogger(__name__)` propagates to root, so handlers attached
+    here via basicConfig cover the whole pipeline.
     """
-    Path("data").mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     log_formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s")
     log_formatter.converter = time.gmtime  # UTC timestamps
 
-    file_handler = logging.FileHandler("data/pipeline.log")
+    file_handler = logging.FileHandler(LOG_DIR / "pipeline.log")
     file_handler.setFormatter(log_formatter)
 
     stdout_handler = logging.StreamHandler(sys.stdout)
@@ -57,97 +47,75 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, stdout_handler])
 
 
-def load_known_symbols() -> List[str]:
-    """Every symbol with a discovered-URL entry in company_urls.json."""
-    if not COMPANY_URLS_JSON.exists():
-        print(f"Error: {COMPANY_URLS_JSON} not found. Run scripts/url_discovery.py first.")
-        sys.exit(1)
-    try:
-        with open(COMPANY_URLS_JSON, "r") as f:
-            company_urls = json.load(f)
-    except Exception as e:
-        print(f"Error reading {COMPANY_URLS_JSON}: {e}")
-        sys.exit(1)
-    return list(company_urls.keys())
+def discover_units(input_dir: Path) -> Dict[str, Path]:
+    """Name -> directory for each unit of work under `input_dir`."""
+    subdirs = sorted(
+        p for p in input_dir.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in _RESERVED_DIRS
+    )
+    if subdirs:
+        loose = [p.name for p in input_dir.iterdir() if p.is_file() and not p.name.startswith(".")]
+        if loose:
+            logger.warning(
+                f"{len(loose)} file(s) directly in {input_dir} are ignored because "
+                f"subdirectories exist; move them into a unit directory"
+            )
+        return {p.name: p for p in subdirs}
+    return {input_dir.name: input_dir}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Data Harvester Pipeline",
-        epilog=(
-            "examples:\n"
-            "  %(prog)s --all-symbols\n"
-            "  %(prog)s --symbol name\n"
-            "  %(prog)s --symbol name --stage index\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument(
-        "--all-symbols",
-        action="store_true",
-        help="Process every symbol in company_urls.json, running all stages.",
-    )
-    selection.add_argument(
-        "--symbol",
-        type=str,
-        metavar="SYM",
-        help="Process a single symbol.",
-    )
-
+    parser = argparse.ArgumentParser(description="RAG processor: ingest purchased documents into LanceDB")
     parser.add_argument(
-        "--stage",
-        type=str,
-        choices=STAGE_ORDER,
-        default=None,
-        metavar="STAGE",
-        help=f"Run exactly one stage instead of the full chain. Requires --symbol. "
-             f"One of: {', '.join(STAGE_ORDER)}.",
+        "--input",
+        type=Path,
+        default=INPUT_DIR,
+        help=f"Directory containing the files to ingest (default: {INPUT_DIR}).",
     )
+    parser.add_argument(
+        "--unit",
+        action="append",
+        metavar="NAME",
+        help="Only process this unit (subdirectory name). Repeatable.",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    if args.stage and args.all_symbols:
-        parser.error("--stage can only be combined with --symbol, not --all-symbols.")
-
-    return args
-
-
-def print_summary(summary: Dict[str, Any]) -> None:
+def print_summary(summary: Dict[str, object]) -> None:
     print(
-        f"\n{summary['total']} symbol(s) processed: "
-        f"{len(summary['succeeded'])} succeeded, {len(summary['failed'])} failed."
+        f"\n{summary['total']} unit(s) processed: "
+        f"{len(summary['succeeded'])} succeeded, {len(summary['failed'])} failed."  # type: ignore[arg-type]
+    )
+    print(
+        f"files: {summary['files_indexed']} indexed, {summary['files_failed']} failed, "
+        f"{summary['files_skipped']} skipped | chunks written: {summary['chunks_written']}"
     )
     if summary["failed"]:
-        print("Failed: " + ", ".join(summary["failed"]))
+        print("Failed units: " + ", ".join(summary["failed"]))  # type: ignore[arg-type]
 
 
 def main() -> None:
+    args = parse_args()  # first, so --help and bad flags have no filesystem side effects
+    ensure_dirs()
     setup_logging()
-    args = parse_args()
 
-    known_symbols = load_known_symbols()
-    runner = PipelineRunner()
-    
-    if args.all_symbols:
-        symbols = known_symbols
-        stage: Optional[str] = None
-        logger.info(f"Mode: all symbols, all stages ({len(symbols)} symbols)")
-    else:
-        if args.symbol not in known_symbols:
-            print(f"Error: '{args.symbol}' not found in {COMPANY_URLS_JSON}. "
-                  f"Run scripts/url_discovery.py or check the symbol spelling.")
+    if not args.input.is_dir():
+        print(f"Error: input directory {args.input} does not exist.")
+        sys.exit(1)
+
+    units = discover_units(args.input)
+    if args.unit:
+        missing: List[str] = [name for name in args.unit if name not in units]
+        if missing:
+            print(f"Error: unit(s) not found under {args.input}: {', '.join(missing)}. "
+                  f"Available: {', '.join(units) or '(none)'}")
             sys.exit(1)
-        symbols = [args.symbol]
-        stage = args.stage
-        if stage:
-            logger.info(f"Mode: single symbol, single stage ({args.symbol} / {stage})")
-        else:
-            logger.info(f"Mode: single symbol, all stages ({args.symbol})")
+        units = {name: units[name] for name in args.unit}
+
+    logger.info(f"Input: {args.input} — {len(units)} unit(s): {', '.join(units)}")
 
     try:
-        summary = runner.run(symbols, stage=stage)
+        summary = PipelineRunner().run(units)
     except KeyboardInterrupt:
         logger.info("Pipeline interrupted by user")
         sys.exit(1)
@@ -156,7 +124,7 @@ def main() -> None:
         sys.exit(1)
 
     print_summary(summary)
-    sys.exit(0 if not summary["failed"] else 1)
+    sys.exit(1 if summary["failed"] or summary["files_failed"] else 0)
 
 
 if __name__ == "__main__":

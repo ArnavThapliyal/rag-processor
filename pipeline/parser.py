@@ -1,317 +1,214 @@
 """
-    1. Ingestion: The parser receives a file path from the retrieval layer (data/raw/)
-    2. Configuration: Reads compute budget flags to determine OCR/translation settings
-    3. Engine Initialization: Sets up docling with appropriate pipeline options  
-    4. Parsing: Passes document directly to layout-aware engine for processing
-    5. Translation: Converts engine output into structured IR blocks using your specifications:
-       - Text elements are tagged appropriately
-       - Tables are converted to Markdown format (not raw text)
-       - Images include captions and bounding box coordinates
-    6. Output: Returns sequential list of IR blocks to pipeline stages
-    Main parsing function that follows the workflow:
-1. Ingest and setup
-2. Execute parsing with layout-aware engine 
-3. Translation to Intermediate Representation
-4. Output packaging
+Document parser: pdf, docx, pptx, html -> ordered structural Blocks (via docling).
 
-Args:
-    file_path (str): Path to input file
-    scratch_dir (pathlib.Path): Directory for temporary processing
-    
-Returns:
-    List[Dict[str, Any]]: List of IR blocks
+    result = Parser().parse(path)   # ParseResult(blocks, page_count, ocr_pages, warnings)
 
+Headings, list items, tables, captions, footnotes and code are told apart by
+docling's item *class* and label (SectionHeaderItem, ListItem, TableItem, ...);
+tables keep their cell structure (Block.table) next to a markdown rendering.
+Page headers/footers live in docling's furniture layer and are not returned.
+
+OCR is on demand: PDFs are parsed first without OCR, pages that came back with
+almost no text are counted, and only if there are some (and few enough to fit
+the budget) is the document re-converted with OCR enabled.
+
+Each Parser owns heavyweight docling converters, built lazily on first use, so
+create one per worker process and never share it across processes.
 """
 
-from typing import Any, List, Dict
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions 
-from docling.datamodel.base_models import InputFormat, BaseFormatOption
-from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-from docling.datamodel.pipeline_options import OcrMacOptions, OcrOptions # Or whichever OCR engine you use
-import pathlib
+from __future__ import annotations
+
 import logging
-import json
-import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from docling_core.types.doc import DocItemLabel, ListItem, SectionHeaderItem, TableItem, TextItem
+
+from config.settings import COMPUTE_BUDGET, PARSER_DEVICE, PARSER_THREADS
+from pipeline.schema import (
+    BLOCK_CAPTION, BLOCK_CODE, BLOCK_FOOTNOTE, BLOCK_HEADER, BLOCK_LIST_ITEM,
+    BLOCK_PARAGRAPH, BLOCK_TABLE, Block, ParseResult, TableData,
+)
 
 logger = logging.getLogger(__name__)
 
+_MAX_WARNING_DETAILS = 5
+_OCR_BACKEND = "torch"  # rapidocr on torch: CPU-safe in workers and needs no extra runtime
+
+
 class Parser:
-    def __init__(self, compute_budget: dict = None):
-        self.compute_budget = compute_budget or self._load_compute_budget()
-        pdf_options = PdfPipelineOptions()
-        if self.compute_budget.get("enable_ml_ocr"):
-            pdf_options.ocr_options = EasyOcrOptions(lang=["en", "hi"] if self.compute_budget.get("enable_hindi_translation") else ["en"])
+    def __init__(self, compute_budget: Optional[Dict[str, Any]] = None):
+        self.compute_budget = {**COMPUTE_BUDGET, **(compute_budget or {})}
+        self._converters: Dict[bool, Any] = {}  # use_ocr -> DocumentConverter
 
-        self.converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=pdf_options,
-                    backend=PyPdfiumDocumentBackend  # <-- Add this argument
-                )
-            }
-        )
+    # ---- public --------------------------------------------------------------
 
-    def _load_compute_budget(self) -> Dict[str, Any]:
-        """Load compute budget settings from configuration"""
-        # This is a placeholder based on your specification
-        # In reality, this would read from config/settings.py
-        return {
-            'enable_ml_ocr': False,
-            'max_pages_for_ocr': 10,
-            'enable_hindi_translation': False
-        }  
-    def run(self, file_path: str, scratch_dir: pathlib.Path = None) -> list[dict]:
-        # For now just return a basic placeholder - the parser interface should be implemented  
-        # This function would actually use docling to parse documents according to your 
-        # spec and would return structured IR blocks
-        
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Input file not found: {file_path}")
-            
-        try:
-            result = self.converter.convert(file_path)
-            doc = result.document
-            blocks = []
-            for item, level in doc.iterate_items():
-                try:
-                    page_no = item.prov[0].page_no if getattr(item, "prov", None) else None
-                    # Check for docling item types properly - these are not simple boolean attributes
-                    if hasattr(item, 'table') and item.table is not None:
-                        # Assuming table items have export_to_dataframe method
-                        md = item.export_to_dataframe(doc=doc).to_markdown(index=False)
-                        blocks.append({"type": "table", "content": md, "page_number": page_no})
-                    elif hasattr(item, 'header') and item.header is not None:
-                        # Headers have text attribute, not the item itself
-                        blocks.append({"type": "header", "content": getattr(item, 'text', ''), "hierarchical_level": getattr(item, 'level', 0), "page_number": page_no})
-                    elif hasattr(item, 'list_item') and item.list_item is not None:
-                        # List items have text attribute
-                        blocks.append({"type": "list_item", "content": getattr(item, 'text', ''), "page_number": page_no})
-                    elif hasattr(item, 'text') and item.text is not None:
-                        # Regular text content - this catches most elements
-                        blocks.append({"type": "paragraph", "content": item.text, "page_number": page_no})
+    def parse(self, file_path: str | Path) -> ParseResult:
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Input file not found: {path}")
+
+        doc = self._converter(use_ocr=False).convert(path, raises_on_error=True).document
+        blocks, warnings = self._extract_blocks(doc)
+        page_count = doc.num_pages() or None
+        ocr_pages = 0
+
+        if path.suffix.lower() == ".pdf" and page_count and self.compute_budget.get("enable_ml_ocr"):
+            low_pages = self._low_text_pages(blocks, page_count)
+            if low_pages:
+                budget = int(self.compute_budget.get("max_pages_for_ocr", 0))
+                if len(low_pages) > budget:
+                    warnings.append(
+                        f"{len(low_pages)} page(s) have little extractable text but exceed the OCR budget "
+                        f"of {budget}; left un-OCRed"
+                    )
+                else:
+                    logger.info(f"{path.name}: OCR pass for {len(low_pages)} low-text page(s)")
+                    ocr_doc = self._converter(use_ocr=True).convert(path, raises_on_error=True).document
+                    ocr_blocks, ocr_warnings = self._extract_blocks(ocr_doc)
+                    if _text_length(ocr_blocks) > _text_length(blocks):
+                        blocks, ocr_pages = ocr_blocks, len(low_pages)
+                        warnings.extend(ocr_warnings)
                     else:
-                        # Try to identify the type by class name or other means
-                        item_type = getattr(item, '__class__', type(item)).__name__
-                        if 'Table' in item_type or 'table' in item_type.lower():
-                            # Handle table items
-                            if hasattr(item, 'export_to_dataframe'):
-                                md = item.export_to_dataframe(doc=doc).to_markdown(index=False)
-                                blocks.append({"type": "table", "content": md, "page_number": page_no})
-                        elif 'Header' in item_type or 'header' in item_type.lower():
-                            # Handle header items
-                            blocks.append({"type": "header", "content": getattr(item, 'text', ''), "hierarchical_level": getattr(item, 'level', 0), "page_number": page_no})
-                        elif 'ListItem' in item_type or 'list_item' in item_type.lower():
-                            # Handle list items
-                            blocks.append({"type": "list_item", "content": getattr(item, 'text', ''), "page_number": page_no})
-                except Exception as e:
-                    logger.warning(f"skipping bad item: {e}")  # per-item, doesn't drop the whole doc
-                    continue
-            return blocks
-            
-        except Exception as e:
-            logger.error(f"Failed to parse document: {e}")
-            raise
+                        warnings.append("OCR pass found no additional text; kept the original parse")
 
-    def _configure_engine(self) -> Dict[str, Any]:
-        """Configure the underlying conversion engine with OCR settings"""
-        # Configure PDF processing pipeline options
-        pdf_options = PdfPipelineOptions()
-        
-        # Apply compute budget settings
-        if self.compute_budget.get('enable_ml_ocr', False):
-            # Enable ML-based OCR (e.g., EasyOCR) if enabled in config
-            pdf_options.ocr_options = EasyOcrOptions()
-            
-        return {
-            'pdf_options': pdf_options,
-            'enable_hindi_translation': self.compute_budget.get('enable_hindi_translation', False)
-        }
+        return ParseResult(blocks=blocks, page_count=page_count, ocr_pages=ocr_pages, warnings=warnings)
 
-    def _translate_document_to_ir(self, document: Any, file_path: str) -> List[Dict[str, Any]]:
-        ir_blocks = []
-        
-        # Get document metadata to extract page info
-        document_metadata = getattr(document, 'metadata', {})
-        
-        # Create a list of all elements in reading order 
-        # (Docling should handle layout traversal correctly)
-        elements = self._extract_elements_from_document(document)
-        
-        # Sequential iteration through tree in reading order
-        for element_idx, element in enumerate(elements):
-            if element is None:
+    # ---- converters ------------------------------------------------------------
+
+    def _converter(self, use_ocr: bool) -> Any:
+        if use_ocr in self._converters:
+            return self._converters[use_ocr]
+
+        # Imported here: docling is slow to import and only parser workers need it.
+        from docling.datamodel.accelerator_options import AcceleratorOptions
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions, RapidOcrOptions, TableFormerMode, TableStructureOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+
+        mode = (
+            TableFormerMode.FAST
+            if str(self.compute_budget.get("table_structure_mode", "accurate")).lower() == "fast"
+            else TableFormerMode.ACCURATE
+        )
+        options = PdfPipelineOptions(
+            do_ocr=use_ocr,
+            do_table_structure=True,
+            table_structure_options=TableStructureOptions(mode=mode, do_cell_matching=True),
+            accelerator_options=AcceleratorOptions(device=PARSER_DEVICE, num_threads=PARSER_THREADS),
+        )
+        if use_ocr:
+            options.ocr_options = RapidOcrOptions(backend=_OCR_BACKEND)
+
+        converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF, InputFormat.DOCX, InputFormat.PPTX, InputFormat.HTML],
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)},
+        )
+        self._converters[use_ocr] = converter
+        return converter
+
+    # ---- docling -> Blocks -----------------------------------------------------
+
+    def _extract_blocks(self, doc: Any) -> Tuple[List[Block], List[str]]:
+        blocks: List[Block] = []
+        errors: List[str] = []
+        skipped = 0
+
+        for item, _ in doc.iterate_items():
+            try:
+                block = self._to_block(item, doc)
+            except Exception as exc:
+                skipped += 1
+                if len(errors) < _MAX_WARNING_DETAILS:
+                    errors.append(f"{type(item).__name__}: {exc}")
                 continue
-                
-            # Convert each element to IR block
-            ir_block = self._element_to_ir_block(element, element_idx, document_metadata)
-            
-            if ir_block:  # Only add non-null blocks
-                ir_blocks.append(ir_block)
-                
-        return ir_blocks
+            if block is not None:
+                blocks.append(block)
 
-    def _extract_elements_from_document(self, document: Any) -> List[Any]:
-        # Docling already provides proper tree traversal with reading order
-        # This would be more complex in real implementation using hierarchical tree
-        elements = []
-        
-        try:
-            # Get root document and iterate elements properly
-            if hasattr(document, 'body'):
-                # For structured documents, extract children
-                self._extract_children_recursive(document.body, elements)
-            
-            # The layout-aware engine handles reading order, we just process what it gives us 
-            return elements
-        except Exception as e:
-            logger.warning(f"Error extracting elements: {e}")
-            return []
+        warnings: List[str] = []
+        if skipped:
+            warnings.append(f"skipped {skipped} unparseable item(s): " + "; ".join(errors))
+        return blocks, warnings
 
-    def _extract_children_recursive(self, node: Any, elements: List[Any]):
-        """Recursively extract child elements for proper ordering"""
-        if hasattr(node, 'children') and node.children:
-            for child in node.children:
-                elements.append(child)
-                self._extract_children_recursive(child, elements)
+    @staticmethod
+    def _to_block(item: Any, doc: Any) -> Optional[Block]:
+        prov = getattr(item, "prov", None)
+        page = prov[0].page_no if prov else None
+
+        if isinstance(item, TableItem):
+            return _table_block(item, doc, page)
+
+        if not isinstance(item, TextItem):
+            return None  # pictures, key-value regions, etc. carry no text of their own
+
+        text = (item.text or "").strip()
+        if not text:
+            return None
+
+        label = item.label
+        if label in (DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER):
+            return None
+        if isinstance(item, SectionHeaderItem):
+            return Block(BLOCK_HEADER, text, page, level=max(1, min(6, int(item.level))))
+        if label == DocItemLabel.TITLE:
+            return Block(BLOCK_HEADER, text, page, level=1)
+        if isinstance(item, ListItem) or label == DocItemLabel.LIST_ITEM:
+            return Block(BLOCK_LIST_ITEM, text, page)
+        if label == DocItemLabel.CAPTION:
+            return Block(BLOCK_CAPTION, text, page)
+        if label == DocItemLabel.FOOTNOTE:
+            return Block(BLOCK_FOOTNOTE, text, page)
+        if label == DocItemLabel.CODE:
+            return Block(BLOCK_CODE, text, page)
+        return Block(BLOCK_PARAGRAPH, text, page)
+
+    @staticmethod
+    def _low_text_pages(blocks: List[Block], page_count: int) -> List[int]:
+        threshold = int(COMPUTE_BUDGET.get("min_chars_per_page_before_ocr", 25))
+        chars = dict.fromkeys(range(1, page_count + 1), 0)
+        for block in blocks:
+            if block.page_number in chars:
+                chars[block.page_number] += len(block.content)
+        return [page for page, n in chars.items() if n < threshold]
+
+
+def _table_block(item: Any, doc: Any, page: Optional[int]) -> Optional[Block]:
+    df = item.export_to_dataframe(doc=doc)
+    if df is None or df.empty:
+        return None
+
+    columns = [str(c).strip() for c in df.columns]
+    rows = [["" if v is None else str(v).strip() for v in row] for row in df.itertuples(index=False, name=None)]
+    # With no detected header docling numbers the columns 0..n-1. Promote the first
+    # row when it reads like a header; otherwise keep every row as data under
+    # neutral names, so nothing is lost either way.
+    if columns == [str(i) for i in range(len(columns))]:
+        if len(rows) > 1 and _looks_like_header(rows[0]):
+            columns, rows = rows[0], rows[1:]
         else:
-            # Add the node itself
-            elements.append(node)
+            columns = [f"col_{i + 1}" for i in range(len(columns))]
+    table = TableData(header=columns, rows=rows)
 
-    def _element_to_ir_block(self, element: Any, element_idx: int, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        # Extract page number (this is part of docling's element metadata)
-        page_number = getattr(element, 'page', 1)  # Default to page 1
-        
-        # Determine block type based on element type
-        block_type = self._get_block_type(element)
-        
-        # Extract content based on block type
-        if block_type == 'table':
-            text_content = self._extract_table_content(element)
-        elif block_type == 'image':
-            text_content = self._extract_image_content(element)
-        else:
-            text_content = self._extract_text_content(element)
-            
-        # Extract hierarchical level (e.g., heading levels)
-        level = self._get_level(element)
-        
-        # Create the IR block
-        ir_block = {
-            'type': block_type,
-            'page_number': page_number,
-            'hierarchical_level': level,
-            'content': text_content,
-            'element_index': element_idx,
-            'metadata': {}
-        }
-        
-        # Add any extra metadata that was available
-        if hasattr(element, 'id'):
-            ir_block['metadata']['element_id'] = element.id # type: ignore
-            
-        return ir_block
+    meta: Dict[str, Any] = {}
+    try:
+        caption = item.caption_text(doc)
+        if caption:
+            meta["caption"] = caption
+    except Exception:
+        pass
+    return Block(BLOCK_TABLE, table.to_markdown(), page, table=table, meta=meta)
 
-    def _get_block_type(self, element: Any) -> str:
-        """Determine the block type from the element"""
-        # Map docling element types to your IR block types
-        element_type_map = {
-            'header': 'header',
-            'paragraph': 'paragraph', 
-            'list_item': 'list_item',
-            'table': 'table',
-            'image': 'image',
-            'figure': 'image',
-            'caption': 'caption'
-        }
-        
-        # Try to get type from element object
-        if hasattr(element, 'type'):
-            return element_type_map.get(element.type.lower(), 'text')
-            
-        # Fallback based on element attributes  
-        if hasattr(element, 'table'):
-            return 'table'
-        elif hasattr(element, 'image'):
-            return 'image'
-        else:
-            # Default to text-like elements
-            return 'paragraph'
 
-    def _extract_text_content(self, element: Any) -> str:
-        """Extract clean text content from an element"""
-        if hasattr(element, 'text'):
-            return element.text
-            
-        # For complex elements, extract all nested text
-        if hasattr(element, 'children'):
-            text_parts = []
-            for child in getattr(element, 'children', []):
-                if hasattr(child, 'text') and child.text:
-                    text_parts.append(child.text)
-            return ' '.join(text_parts)
-            
-        return ""
+_NUMERIC_LIKE = re.compile(r"^[\s()+\-–—,.%$₹€£\d]+$")
 
-    def _extract_table_content(self, element: Any) -> str:
-        """Extract table content into Markdown grid format"""
-        # This will be enhanced based on actual docling table structure
-        try:
-            # If element has a table attribute or similar
-            if hasattr(element, 'table'):
-                # Convert structured data to markdown grid
-                return self._to_markdown_table(element.table)
-            else:
-                # Fallback for raw tables (in practice, docling should provide proper tables)
-                return "| Column 1 | Column 2 |\n|----------|----------|\n| Data 1   | Data 2   |"
-        except Exception as e:
-            logger.warning(f"Error extracting table: {e}")
-            return ""
 
-    def _to_markdown_table(self, table_data: Any) -> str:
-        """Convert tabular data to Markdown grid format"""
-        # This is a simplified example - real implementation would use docling's table structure
-        if not hasattr(table_data, 'rows'):
-            return "| Column 1 | Column 2 |\n|----------|----------|\n| Data 1   | Data 2   |"
-            
-        # For demo purposes, just return placeholder
-        rows = getattr(table_data, 'rows', [])
-        return "| Row 1 Col 1 | Row 1 Col 2 |\n|-------------|-------------|\n| Data 1      | Data 2      |"
+def _looks_like_header(row: List[str]) -> bool:
+    """All cells filled in and none purely numeric ('FY25' qualifies; '1,200' or '2024' do not)."""
+    return all(cell and not _NUMERIC_LIKE.match(cell) for cell in row)
 
-    def _extract_image_content(self, element: Any) -> str:
-        """Extract image information and captions"""
-        caption = ""
-        if hasattr(element, 'caption'):
-            caption = element.caption
-            
-        # Extract coordinate info if available
-        coordinates = {}
-        if hasattr(element, 'bbox'):
-            coordinates = {
-                'x0': getattr(element.bbox, 'x0', 0),
-                'y0': getattr(element.bbox, 'y0', 0), 
-                'x1': getattr(element.bbox, 'x1', 0),
-                'y1': getattr(element.bbox, 'y1', 0)
-            }
-            
-        # Format for IR block
-        image_info = {
-            "caption": caption,
-            "coordinates": coordinates
-        }
-        
-        return json.dumps(image_info)
 
-    def _get_level(self, element: Any) -> int:
-        """Get hierarchical level from element (e.g., header level 1-6)"""
-        if hasattr(element, 'level'):
-            return element.level
-            
-        # Default for non-header elements
-        return 0
-
-# Convenience function for direct usage, though typically called via pipeline.py
-def parse_file(file_path: str, scratch_dir: pathlib.Path) -> List[Dict[str, Any]]:
-    """Convenience function to parse a single file"""
-    parser = Parser()
-    return parser.run(file_path, scratch_dir)
+def _text_length(blocks: List[Block]) -> int:
+    return sum(len(b.content) for b in blocks)
