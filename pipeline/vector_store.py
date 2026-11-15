@@ -1,252 +1,209 @@
 """
-Vector store implementation using LanceDB for RAG pipeline.
+LanceDB writer for the `documents` table (schema: pipeline.schema.ChunkRecord).
 
-This module provides a proper vector store that:
-- Uses LanceDB as the backend (data/lancedb directory)
-- Supports similarity search and top-k queries
-- Handles chunk data with proper content/text field mapping
-- Uses proper embedding dimensions (1024 for bge-m3)
-- Implements batch operations and proper error handling
-- Enforces required fields like source_url and page_range
+    store = VectorStore()
+    store.open_or_create()          # refuses a table whose schema differs
+    store.recover()                 # drop documents a crashed run left half-written
+    store.add(records)              # append; one call is atomic
+    store.finalize()                # scalar + cosine vector indexes, once per run
+
+Append-only: there is no upsert. "A doc_id is present" must always mean "that
+document is complete", so a document is normally written with a single add().
+A document too large for one add is written in parts between begin_partial()
+and finish_partial(); the doc_id sits in a small ledger file meanwhile, and
+recover() deletes whatever such a document left behind after a crash.
+
+Retrieval belongs to the LLM stage. Only count() and get_by_doc_id() are
+provided, for verification and tests.
 """
 
-import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from __future__ import annotations
+
 import json
+import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Set
 
 import lancedb
-from lancedb.pydantic import LanceModel
-from lancedb.embeddings import EmbeddingFunctionConfig, TextEmbeddingFunction
-import pandas as pd
+import pyarrow as pa
+
+from config.settings import DISTANCE_METRIC, LANCEDB_PATH, LANCEDB_TABLE, VECTOR_INDEX_MIN_ROWS
+from pipeline.schema import VECTOR_COLUMN, ChunkRecord
 
 logger = logging.getLogger(__name__)
 
-# Define the LanceDB schema for company documents
-class CompanyDocument(LanceModel):
-    chunk_id: str
-    content: str
-    embedding: List[float]
-    source_url: str
-    page_range: str
-    symbol: str
-    timestamp: str
-    content_hash: str
-    doc_type: str
-    section_path: str
-    source_filename: str
-    # --- NEW: Store raw metadata as a JSON string to prevent dropping fields ---
-    metadata_json: str 
+_DOC_ID = re.compile(r"[0-9a-f]{32}")
+_ID_QUERY_BATCH = 500
+_SCALAR_INDEX_COLUMNS = ("doc_id", "symbol")
+_LEDGER_NAME = "_inflight_docs.json"
 
 
-class VectorStore: 
-    def __init__(self, db_path: Union[str, Path] = "data/lancedb"):
-        self.db_path = Path(db_path)
-        self.db_path.mkdir(parents=True, exist_ok=True)
-        self.db = None
-        self.table_name = "company_documents"
-        
-    def _get_db(self):
-        if self.db is None:
-            self.db = lancedb.connect(self.db_path)
-        return self.db
-    
-    def _validate_embedding_dimensions(self, embedding: List[float]) -> None:
-        """Validate that the embedding has the expected dimensions (1024 for bge-m3)."""
-        if len(embedding) != 1024:
-            raise ValueError(f"Expected embedding dimension 1024, got {len(embedding)}")
-    
-    def run(self, chunks: List[Dict[str, Any]], symbol: str) -> None:
+class SchemaMismatchError(RuntimeError):
+    """The existing table does not match ChunkRecord; writing would corrupt the contract."""
+
+
+def _check_doc_id(doc_id: str) -> str:
+    # doc ids are interpolated into filter strings; only our own hex ids are ever accepted
+    if not isinstance(doc_id, str) or not _DOC_ID.fullmatch(doc_id):
+        raise ValueError(f"not a valid doc_id: {doc_id!r}")
+    return doc_id
+
+
+class VectorStore:
+    def __init__(self, path: Path | str = LANCEDB_PATH, table_name: str = LANCEDB_TABLE):
+        self.path = Path(path)
+        self.table_name = table_name
+        self._schema: pa.Schema = ChunkRecord.to_arrow_schema()
+        self._db: Any = None
+        self._table: Any = None
+
+    # ---- open ------------------------------------------------------------------
+
+    def open_or_create(self) -> "VectorStore":
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._db = lancedb.connect(str(self.path))
         try:
-            db = self._get_db()
-            
-            # Process chunks in batches for better performance
-            if not chunks:
-                logger.warning("No chunks to process")
-                return
-                
-            # Convert chunks to proper format and validate
-            processed_chunks = []
-            for chunk in chunks:
-                # Handle the content/text key mismatch - prefer 'content' field
-                content = chunk.get('content', chunk.get('text', ''))
-                
-                # Validate required fields
-                source_url = chunk.get('source_url', '')
-                page_range = chunk.get('page_range', '')
-                
-                if not source_url:
-                    logger.warning(f"Missing source_url in chunk for symbol {symbol}")
-                if not page_range:
-                    logger.warning(f"Missing page_range in chunk for symbol {symbol}")
-                
-                # Ensure embedding exists and validate dimensions
-                embedding = chunk.get('embedding', [])
-                if not isinstance(embedding, list):
-                    raise ValueError("Embedding must be a list")
-                
-                self._validate_embedding_dimensions(embedding)
-                
-                # Extract metadata if it exists
-                metadata = chunk.get('metadata', {})
+            table = self._db.open_table(self.table_name)
+        except ValueError as exc:
+            if "not found" not in str(exc).lower():  # only a missing table means "create"
+                raise
+            self._table = self._db.create_table(self.table_name, schema=ChunkRecord)
+            logger.info(f"created table {self.table_name!r} at {self.path}")
+        else:
+            self._require_matching_schema(table.schema)
+            self._table = table
+        return self
 
-                # Create the chunk record
-                processed_chunk = {
-                    'chunk_id': chunk.get('chunk_id', ''),
-                    'content': content,
-                    'embedding': embedding,
-                    'source_url': source_url,
-                    'page_range': page_range,
-                    'symbol': symbol,
-                    'timestamp': chunk.get('timestamp', ''),
-                    'content_hash': chunk.get('content_hash', ''),
-                    'doc_type': metadata.get('doc_type', 'unknown'),
-                    'section_path': metadata.get('section_path', ''),
-                    'source_filename': metadata.get('source_filename', ''),
-                    
-                    # --- NEW: Serialize the entire metadata dict to JSON ---
-                    'metadata_json': json.dumps(metadata)
-                }
-                
-                processed_chunks.append(processed_chunk)
-            
-            # Convert to DataFrame for batch operations
-            df = pd.DataFrame(processed_chunks)
-            
-            # Get or create the table and use merge_insert for efficient batch upsert
-            try:
-                table = db.open_table(self.table_name)
-            except Exception:
-                # Table doesn't exist, create it
-                table = db.create_table(self.table_name, schema=CompanyDocument)
-            
-            # Step 1: Define the column to match on (chunk_id)  
-            match_column = "chunk_id"
-            
-            # Step 2: Define update/insert rules - using merge_insert for upserts
-            # Step 3: Execute the data injection at the very end using .execute(df)
-            operation = table.merge_insert("chunk_id") \
-                                .when_matched_update_all() \
-                                .when_not_matched_insert_all() \
-                                .execute(df)
-            
-            logger.info(f"Successfully stored {len(processed_chunks)} chunks for symbol {symbol}")
-            
-        except Exception as e:
-            logger.error(f"Failed to store chunks in vector store: {e}", exc_info=True)
-            raise
-    
-    def search(
-        self, 
-        query_embedding: List[float], 
-        symbol: str, 
-        k: int = 5
-    ) -> List[Dict[str, Any]]:
+    def _require_matching_schema(self, existing: pa.Schema) -> None:
+        if existing.equals(self._schema):
+            return
+        have = {f.name: str(f.type) for f in existing}
+        want = {f.name: str(f.type) for f in self._schema}
+        problems = (
+            [f"missing column {n}" for n in want if n not in have]
+            + [f"unexpected column {n}" for n in have if n not in want]
+            + [f"{n}: is {have[n]}, expected {want[n]}" for n in want if n in have and have[n] != want[n]]
+        ) or ["column order differs"]
+        raise SchemaMismatchError(
+            f"table {self.table_name!r} at {self.path} does not match the current schema "
+            f"({'; '.join(problems[:8])}). Load into a new table or path instead of this one."
+        )
+
+    @property
+    def table(self) -> Any:
+        if self._table is None:
+            self.open_or_create()
+        return self._table
+
+    # ---- write -----------------------------------------------------------------
+
+    def add(self, records: Sequence[Dict[str, Any]]) -> int:
+        """Append rows built by schema.build_record. Returns the number written."""
+        if not records:
+            return 0
+        # Building against the schema first means a malformed row fails here, before any write.
+        batch = pa.Table.from_pylist(list(records), schema=self._schema)
+        self.table.add(batch)
+        return batch.num_rows
+
+    def delete_doc(self, doc_id: str) -> None:
+        self.table.delete(f"doc_id = '{_check_doc_id(doc_id)}'")
+
+    # ---- partial-document ledger ---------------------------------------------------
+
+    @property
+    def _ledger_path(self) -> Path:
+        return self.path / _LEDGER_NAME
+
+    def _read_ledger(self) -> List[str]:
         try:
-            self._validate_embedding_dimensions(query_embedding)
-            
-            db = self._get_db()
-            table = db.open_table(self.table_name)
-            
-            # Filter by symbol and perform similarity search
-            results = table.search(query_embedding)\
-                .where(f"symbol = '{symbol}'")\
-                .limit(k)\
-                .to_list()
-            
-            # Convert results to proper format
-            formatted_results = []
-            for result in results:
-                # --- NEW: Deserialize the metadata back into a dictionary ---
-                metadata_dict = {}
-                raw_meta = result.get('metadata_json', '{}')
-                if raw_meta:
-                    try:
-                        metadata_dict = json.loads(raw_meta)
-                    except json.JSONDecodeError:
-                        pass
-                
-                # Extract the content and other metadata
-                chunk_data = {
-                    'chunk_id': result.get('chunk_id', ''),
-                    'content': result.get('content', ''),
-                    'source_url': result.get('source_url', ''),
-                    'page_range': result.get('page_range', ''),
-                    'symbol': result.get('symbol', ''),
-                    'timestamp': result.get('timestamp', ''),
-                    'doc_type': result.get('doc_type', ''),
-                    'section_path': result.get('section_path', ''),
-                    'source_filename': result.get('source_filename', ''),
-                    'metadata': metadata_dict
-                }
-                formatted_results.append(chunk_data)
-            
-            logger.info(f"Found {len(formatted_results)} matching chunks for symbol {symbol}")
-            return formatted_results
-            
-        except Exception as e:
-            logger.error(f"Failed to search in vector store: {e}", exc_info=True)
+            data = json.loads(self._ledger_path.read_text())
+        except (OSError, ValueError):
             return []
-    
-    def get_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            db = self._get_db()
-            table = db.open_table(self.table_name)
-            
-            # Perform exact match search
-            results = table.search().where(f"chunk_id = '{chunk_id}'").limit(1).to_list()            
-            if results:
-                # Deserialize metadata_json for direct ID lookups too
-                result = results[0]
-                if 'metadata_json' in result:
-                    try:
-                        result['metadata'] = json.loads(result.pop('metadata_json'))
-                    except Exception:
-                        result['metadata'] = {}
-                return result
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to get chunk by ID {chunk_id}: {e}", exc_info=True)
-            return None
-    
-    def get_by_symbol(self, symbol: str) -> List[Dict[str, Any]]:
-        try:
-            db = self._get_db()
-            table = db.open_table(self.table_name)
-            
-            # Filter by symbol
-            results = table.search().where(f"symbol = '{symbol}'").to_list()
-            
-            # Fix metadata format for all returned results
-            for result in results:
-                if 'metadata_json' in result:
-                    try:
-                        result['metadata'] = json.loads(result.pop('metadata_json'))
-                    except Exception:
-                        result['metadata'] = {}
-                        
-            return results
-            
-        except Exception as e:
-            logger.error(f"Failed to get chunks for symbol {symbol}: {e}", exc_info=True)
-            return []
-    
-    def get_metadata(self, symbol: str) -> Dict[str, Any]:
-        try:
-            db = self._get_db()
-            table = db.open_table(self.table_name)
-            
-            # Get count of chunks and some statistics
-            results = table.search().where(f"symbol = '{symbol}'").to_list()
-            
-            return {
-                "symbol": symbol,
-                "total_chunks": len(results),
-                "first_chunk_id": results[0].get('chunk_id', '') if results else None,
-                "last_chunk_id": results[-1].get('chunk_id', '') if results else None,
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to get metadata for symbol {symbol}: {e}", exc_info=True)
-            return {"symbol": symbol, "total_chunks": 0, "error": str(e)}
+        return [d for d in data if isinstance(d, str) and _DOC_ID.fullmatch(d)] if isinstance(data, list) else []
+
+    def _write_ledger(self, doc_ids: Iterable[str]) -> None:
+        ids = sorted(set(doc_ids))
+        if not ids:
+            self._ledger_path.unlink(missing_ok=True)
+            return
+        tmp = self._ledger_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ids))
+        tmp.replace(self._ledger_path)
+
+    def begin_partial(self, doc_id: str) -> None:
+        """Call before the first of several add() calls for one document."""
+        self._write_ledger([*self._read_ledger(), _check_doc_id(doc_id)])
+
+    def finish_partial(self, doc_id: str) -> None:
+        """Call after the last add() for that document succeeded."""
+        self._write_ledger(d for d in self._read_ledger() if d != doc_id)
+
+    def abort_partial(self, doc_id: str) -> None:
+        """Remove whatever was written for a document that failed part-way."""
+        self.delete_doc(doc_id)
+        self.finish_partial(doc_id)
+
+    def recover(self) -> List[str]:
+        """Delete documents an interrupted run left half-written. Returns their ids."""
+        stale = self._read_ledger()
+        for doc_id in stale:
+            logger.warning(f"removing partially written document {doc_id} left by an interrupted run")
+            self.delete_doc(doc_id)
+        self._write_ledger([])
+        return stale
+
+    # ---- read (verification only) --------------------------------------------------
+
+    def count(self) -> int:
+        return self.table.count_rows()
+
+    def has_doc(self, doc_id: str) -> bool:
+        return self.table.count_rows(f"doc_id = '{_check_doc_id(doc_id)}'") > 0
+
+    def existing_doc_ids(self, doc_ids: Iterable[str]) -> Set[str]:
+        """Which of these doc_ids already have rows in the table."""
+        wanted = sorted({_check_doc_id(d) for d in doc_ids})
+        found: Set[str] = set()
+        for start in range(0, len(wanted), _ID_QUERY_BATCH):
+            id_list = ", ".join(f"'{d}'" for d in wanted[start:start + _ID_QUERY_BATCH])
+            hits = self.table.search().where(f"doc_id IN ({id_list})").select(["doc_id"]).to_arrow()
+            found.update(hits.column("doc_id").to_pylist())
+        return found
+
+    def get_by_doc_id(self, doc_id: str) -> List[Dict[str, Any]]:
+        rows = self.table.search().where(f"doc_id = '{_check_doc_id(doc_id)}'").to_list()
+        return sorted(rows, key=lambda r: r["chunk_index"])
+
+    # ---- indexes ---------------------------------------------------------------
+
+    def finalize(self) -> Dict[str, Any]:
+        """
+        Once per run, after all writes: scalar indexes on the filter columns and
+        the cosine vector index. Small tables get no vector index (a brute-force
+        scan is exact and fast); readers must then pass metric="cosine" themselves.
+        """
+        table = self.table
+        rows = table.count_rows()
+        report: Dict[str, Any] = {"rows": rows, "vector_index": "none"}
+        if rows == 0:
+            return report
+
+        from lancedb.index import BTree, IvfPq
+
+        existing = {tuple(i.columns): i for i in table.list_indices()}
+        for column in _SCALAR_INDEX_COLUMNS:
+            if (column,) not in existing:
+                table.create_index(column, config=BTree())
+
+        if (VECTOR_COLUMN,) in existing:
+            table.optimize()  # folds newly appended rows into the existing indexes
+            report["vector_index"] = "updated"
+        elif rows >= VECTOR_INDEX_MIN_ROWS:
+            table.create_index(VECTOR_COLUMN, config=IvfPq(distance_type=DISTANCE_METRIC))
+            report["vector_index"] = "created"
+        else:
+            table.optimize()
+        logger.info(f"finalised {self.table_name!r}: {report}")
+        return report

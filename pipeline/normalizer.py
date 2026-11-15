@@ -1,9 +1,7 @@
 """
 Normalizer for pipeline - normalizes document data for vectorization.
 """
-import os
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any

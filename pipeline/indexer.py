@@ -16,15 +16,15 @@ Indexing is atomic per file. A failed parse, clean, chunk, or embedding step
 never reaches the database. Other files continue processing independently.
 """
 
-import hashlib
 import logging
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from config.settings import SCRATCH_DIR
+from config.settings import EMBEDDING_MODEL, PIPELINE_VERSION, SCRATCH_DIR
 from pipeline.metadata import MetadataResolver, build_source_document
-from pipeline.schema import SourceDocument, make_chunk_id
+from pipeline.schema import SourceDocument, build_record
 from pipeline.type_router import HANDLER_DOCUMENT, RoutedFile, open_routed
 from pipeline.parser import Parser
 from pipeline.cleaner import clean_blocks
@@ -34,11 +34,15 @@ from pipeline.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
+_ALREADY_INGESTED = -1
+
 
 class Indexer:
     def __init__(self):
         self._parser = Parser()
         self._embedder: Embedder | None = None  # loaded on first use
+        self._store = VectorStore()
+        self._run_id = uuid.uuid4().hex[:12]
 
     def index_files(self, files: Sequence[Path], root: Path) -> Dict[str, Any]:
         """
@@ -69,7 +73,9 @@ class Indexer:
                         except Exception as exc:
                             logger.warning(f"[indexer] failed on {item.display_name}: {exc}", exc_info=True)
                             n = 0
-                        if n == 0:
+                        if n == _ALREADY_INGESTED:
+                            files_skipped += 1
+                        elif n == 0:
                             files_failed += 1
                             failed_files.append(item.display_name)
                         else:
@@ -92,7 +98,9 @@ class Indexer:
     def _index_file(self, item: RoutedFile, doc: SourceDocument) -> int:
         # Interim glue: maps the new SourceDocument onto the legacy chunk/metadata dicts
         # the old cleaner/chunker/embedder/store expect. Replaced in Steps 4-6.
-        symbol = doc.symbol or ""
+        if self._store.has_doc(doc.doc_id):
+            logger.info(f"[indexer] {doc.source_filename}: already ingested (doc_id {doc.doc_id}); skipping")
+            return _ALREADY_INGESTED
         source_filename = doc.source_filename
         result = self._parser.parse(item.path)
         for warning in result.warnings:
@@ -101,29 +109,13 @@ class Indexer:
         new_chunks = chunk_document(blocks, size_fn=token_counter())
         if not new_chunks:
             return 0
-        # Legacy embedder/store still take dicts (replaced in Step 5).
-        chunks = [
-            {"chunk_id": make_chunk_id(doc.doc_id, c.index, c.text), "content": c.text,
-             "section_path": c.section_path or "", "page_range": c.page_range or "unknown"}
-            for c in new_chunks
-        ]
-
-        now = datetime.now(timezone.utc).isoformat()
-        for chunk in chunks:
-            chunk["content_hash"] = hashlib.sha256(chunk["content"].encode()).hexdigest()
-            chunk["source_url"] = doc.source_url or ""
-            chunk["page_range"] = chunk.get("page_range", "unknown")
-            chunk["metadata"] = {
-                "symbol": symbol,
-                "source_filename": source_filename,
-                "doc_type": doc.doc_type or "unknown",
-                "downloaded_at": now,   # embed time, not actual download time
-                "section_path": chunk.get("section_path", ""),
-            }
-
         if self._embedder is None:
             self._embedder = Embedder()
-        vectors = self._embedder.encode([c["content"] for c in chunks])
-        embedded = [{**c, "embedding": v.tolist()} for c, v in zip(chunks, vectors)]
-        VectorStore().run(embedded, symbol)
-        return len(embedded)
+        vectors = self._embedder.encode([c.text for c in new_chunks])
+        now = datetime.now(timezone.utc).isoformat()
+        records = [
+            build_record(doc, chunk, vector, ingested_at=now, ingest_run_id=self._run_id,
+                         embedding_model=EMBEDDING_MODEL, pipeline_version=PIPELINE_VERSION)
+            for chunk, vector in zip(new_chunks, vectors)
+        ]
+        return self._store.add(records)  # one add per document: atomic
