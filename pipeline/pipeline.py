@@ -20,12 +20,14 @@ FAILURE MODEL:
 """
 
 import logging
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from config.settings import LANCEDB_PATH, LOG_DIR, SCRATCH_DIR
 from pipeline.indexer import Indexer
 from pipeline.metadata import is_metadata_file
+from pipeline.type_router import HANDLER_UNSUPPORTED, open_routed
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +65,34 @@ def discover_files(root: Path) -> List[Path]:
     return sorted(files)
 
 
+def dry_run(root: Path) -> Dict[str, Any]:
+    """
+    Discover and route only: what a run would process, by detected type, and
+    what it would skip and why. Nothing is parsed, embedded or written.
+    """
+    root = Path(root)
+    files = discover_files(root)
+    by_type: Counter = Counter()
+    unsupported: Counter = Counter()
+    errors: List[str] = []
+    for path in files:
+        try:
+            with open_routed(path, SCRATCH_DIR) as routed:
+                for item in routed:
+                    if item.handler == HANDLER_UNSUPPORTED:
+                        unsupported[item.reason or "unsupported"] += 1
+                    else:
+                        by_type[item.source_type] += 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return {"root": str(root), "files_found": len(files), "by_source_type": dict(by_type),
+            "unsupported": dict(unsupported), "routing_errors": errors}
+
+
 class PipelineRunner:
 
-    def __init__(self) -> None:
-        self._indexer = Indexer()
+    def __init__(self, workers: Optional[int] = None, indexer: Optional[Any] = None) -> None:
+        self._indexer = indexer if indexer is not None else Indexer(workers=workers)
 
     def run(self, root: Path) -> Dict[str, Any]:
         root = Path(root)
@@ -77,6 +103,7 @@ class PipelineRunner:
         result = self._validate_result(self._indexer.index_files(files, base))
 
         summary = {
+            **result,
             "root": str(root),
             "files_found": len(files),
             **{key: int(result.get(key, 0) or 0) for key in _COUNTER_KEYS},

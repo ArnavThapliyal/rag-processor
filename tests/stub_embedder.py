@@ -36,3 +36,24 @@ class StubModel:
 def make_stub_embedder() -> Embedder:
     """Picklable factory for the embedding process in multi-process tests."""
     return Embedder(model=StubModel(), batch_size=16)
+
+
+def broken_embedder_factory() -> Embedder:
+    """Stands in for a model that cannot be loaded (no weights, no memory, ...)."""
+    raise RuntimeError("model weights unavailable")
+
+
+class FlakyEmbedder:
+    """Embeds normally until `fail_after` texts have been seen, then raises on every call."""
+
+    batch_size = 16
+
+    def __init__(self, fail_after: int):
+        self.fail_after = fail_after
+        self.seen = 0
+
+    def encode(self, texts):
+        self.seen += len(texts)
+        if self.seen > self.fail_after:
+            raise RuntimeError("device lost")
+        return np.stack([text_vector(t) for t in texts])

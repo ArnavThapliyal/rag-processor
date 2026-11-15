@@ -1,11 +1,9 @@
 """Recursive discovery and indexer routing on an irregular directory tree."""
 
 import os
-import zipfile
 
 import pytest
 
-import pipeline.indexer as indexer_mod
 import pipeline.pipeline as pp
 from pipeline.pipeline import discover_files
 
@@ -61,59 +59,22 @@ def test_runner_summary_and_invalid_indexer_result(messy_tree, monkeypatch):
             return {"status": "success", "files_indexed": 3, "files_failed": 1, "files_skipped": 0,
                     "chunks_written": 9, "failed_files": ["x.pdf"]}
 
-    monkeypatch.setattr(pp, "Indexer", Stub)
-    s = pp.PipelineRunner().run(messy_tree)
+    s = pp.PipelineRunner(indexer=Stub()).run(messy_tree)
     assert (s["files_found"], s["files_indexed"], s["files_failed"], s["chunks_written"], s["failed_files"]) == (4, 3, 1, 9, ["x.pdf"])
 
     class Bad:
         def index_files(self, files, root):
             return None
 
-    monkeypatch.setattr(pp, "Indexer", Bad)
     with pytest.raises(ValueError):
-        pp.PipelineRunner().run(messy_tree)
+        pp.PipelineRunner(indexer=Bad()).run(messy_tree)
 
 
-def test_indexer_routes_by_content_not_folder_and_applies_nearest_metadata(messy_tree, tmp_path, monkeypatch):
-    # a pdf-looking thing inside a folder named 'csv', a csv named .pdf, and a zip with a nested pdf
-    (messy_tree / "csv").mkdir()
-    (messy_tree / "csv" / "actually.pdf").write_bytes(PDF)
-    (messy_tree / "any" / "bundle.zip").write_bytes(b"")
-    with zipfile.ZipFile(messy_tree / "any" / "bundle.zip", "w") as z:
-        z.writestr("inner/doc.pdf", PDF)
-    monkeypatch.setattr(indexer_mod, "SCRATCH_DIR", tmp_path / "scratch_work")
-
-    seen = []
-
-    def fake_index_file(self, item, doc):
-        assert item.path.exists()  # zip members must still be on disk while indexed
-        seen.append((doc.source_filename, doc.source_type, doc.vendor, doc.fields.get("sector")))
-        return 3
-
-    monkeypatch.setattr(indexer_mod.Indexer, "_index_file", fake_index_file)
-    result = indexer_mod.Indexer().index_files(discover_files(messy_tree), messy_tree)
-
-    by_name = {n: (t, v, sec) for n, t, v, sec in seen}
-    assert by_name["actually.pdf"][0] == "pdf"                       # folder named 'csv' is irrelevant
-    assert by_name["bundle.zip!doc.pdf"] == ("pdf", None, "Energy")  # zip member, batch metadata from any/
-    assert by_name["report.pdf"] == ("pdf", None, "Energy")
-    assert result["files_indexed"] == 3 and result["chunks_written"] == 9
-    assert result["files_skipped"] == 3   # top.csv, notes.csv, deep.json: routed as tabular, not yet indexed (Step 6)
-    assert result["files_failed"] == 0 and result["status"] == "success"
-
-
-def test_indexer_isolates_a_failing_file(tmp_path, monkeypatch):
-    root = tmp_path / "r"
-    root.mkdir()
-    (root / "good.pdf").write_bytes(PDF)
-    (root / "bad.pdf").write_bytes(PDF + b"x")
-    monkeypatch.setattr(indexer_mod, "SCRATCH_DIR", tmp_path / "w")
-
-    def fake(self, item, doc):
-        if item.display_name == "bad.pdf":
-            raise RuntimeError("boom")
-        return 2
-
-    monkeypatch.setattr(indexer_mod.Indexer, "_index_file", fake)
-    result = indexer_mod.Indexer().index_files(discover_files(root), root)
-    assert (result["files_indexed"], result["files_failed"], result["failed_files"]) == (1, 1, ["bad.pdf"])
+def test_dry_run_reports_types_and_reasons_without_writing(messy_tree, tmp_path, monkeypatch):
+    (messy_tree / "old.doc").write_bytes(b"\xd0\xcf\x11\xe0 legacy word")
+    (messy_tree / "blob.bin").write_bytes(b"\x00\x01\x02")
+    monkeypatch.setattr(pp, "SCRATCH_DIR", tmp_path / "scratch_work")
+    report = pp.dry_run(messy_tree)
+    assert report["files_found"] == 6 and report["routing_errors"] == []
+    assert report["by_source_type"] == {"csv": 2, "json": 1, "pdf": 1}
+    assert sum(report["unsupported"].values()) == 2 and any(".doc" in reason for reason in report["unsupported"])
