@@ -47,13 +47,33 @@ def test_repetition_pass_is_skipped_for_page_less_documents():
     assert len(kept) == 30
 
 
-def test_denylist_and_bare_page_numbers():
-    blocks = [para("Page 3 of 12", 3), para("page 4", 4), para("----------", 1), para("- 7 -", 7),
-              para("Scanned with CamScanner", 1), para("Revenue grew 7 percent.", 1), para("2025")]
-    kept, removed = clean_blocks(blocks, page_count=7)
-    # '2025' has no page number (html/docx), so it is not assumed to be a page number
-    assert texts(kept) == ["Revenue grew 7 percent.", "2025"]
-    assert any("bare page number" in line for line in removed)
+def test_denylist_patterns_are_removed():
+    blocks = [para("Page 3 of 12", 3), para("page 4", 4), para("----------", 1),
+              para("Scanned with CamScanner", 1), para("Revenue grew 7 percent.", 1)]
+    kept, removed = clean_blocks(blocks, page_count=4)
+    assert texts(kept) == ["Revenue grew 7 percent."] and len(removed) == 4
+
+
+def test_printed_page_numbers_are_removed_only_at_page_edges():
+    blocks = []
+    for page in range(1, 6):      # footer numbers offset by 10 from the pdf page index (front matter)
+        blocks += [para(f"Body of page {page}.", page), para(str(page + 10), page)]
+    blocks += [para("Last page body.", 6), para("- 6 -", 6)]            # equals its page number
+    kept, removed = clean_blocks(blocks, page_count=6)
+    assert texts(kept) == [f"Body of page {p}." for p in range(1, 6)] + ["Last page body."]
+    assert removed == ["printed page number (x6)"]
+
+
+def test_loose_numbers_are_data_not_page_numbers():
+    # what a table looks like when structure detection fails: cells as separate paragraphs
+    blocks = [para("Segment results", 3), para("Services", 3), para("1,240", 3), para("810", 3),
+              para("Others", 3), para("95", 3), para("Closing remarks.", 3), para("2025")]
+    kept, removed = clean_blocks(blocks, page_count=3)
+    assert texts(kept) == [b.content for b in blocks] and removed == []
+
+    ends_with_number = [para("Total employees", 4), para("95", 4)]       # last block, but no page-number pattern
+    kept, removed = clean_blocks(ends_with_number, page_count=9)
+    assert texts(kept) == ["Total employees", "95"] and removed == []
 
 
 def test_whitespace_normalised_only_in_prose_and_input_untouched():

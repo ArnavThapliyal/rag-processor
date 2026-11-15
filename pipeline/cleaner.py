@@ -9,7 +9,10 @@ whitespace in tables, lists and code is left alone.
 
 What is removed:
   - blocks matching CLEAN_DENYLIST_PATTERNS ("Page 3 of 12", rule lines, ...);
-  - bare page numbers in paged documents;
+  - printed page numbers: a bare number that is the first or last block on its
+    page and either equals the page number or follows the same offset on several
+    pages. A bare number anywhere else is kept, because when table detection
+    fails the cells of a table arrive as loose numbers;
   - running headers/footers: a short paragraph repeated on a large share of the
     pages of a long document. Headings, tables, lists, captions, footnotes and
     code are never removed this way, and neither are value-like cells ("Nil",
@@ -40,7 +43,8 @@ logger = logging.getLogger(__name__)
 _PROSE_TYPES = frozenset({BLOCK_PARAGRAPH, BLOCK_HEADER, BLOCK_CAPTION, BLOCK_FOOTNOTE})
 
 _DENYLIST = [re.compile(p, re.IGNORECASE) for p in CLEAN_DENYLIST_PATTERNS]
-_BARE_PAGE_NUMBER = re.compile(r"[-–—\s]*\d{1,4}[-–—\s]*")
+_BARE_PAGE_NUMBER = re.compile(r"[-–—\s]*(\d{1,4})[-–—\s]*")
+_MIN_PAGES_SHARING_OFFSET = 3
 # Digits, punctuation and currency only: a value, not a running header.
 _VALUE_LIKE = re.compile(r"[\s\d.,:%()+\-–—/₹$€£]*")
 _VALUE_WORDS = frozenset({"nil", "n.a.", "n.a", "na", "n/a", "none", "yes", "no", "total", "-do-", "ditto"})
@@ -71,6 +75,30 @@ def _repeated_boilerplate(blocks: Sequence[Block], page_count: Optional[int]) ->
     return {text for text, pages in pages_by_text.items() if len(pages) >= needed}
 
 
+def _printed_page_numbers(blocks: Sequence[Block]) -> Set[int]:
+    """Positions (indexes into blocks) of bare numbers that are printed page numbers."""
+    edges: Dict[int, List[int]] = {}  # page -> [index of its first block, index of its last block]
+    for position, block in enumerate(blocks):
+        if block.page_number is None:
+            continue
+        edge = edges.setdefault(block.page_number, [position, position])
+        edge[1] = position
+
+    candidates: List[Tuple[int, int]] = []  # (position, printed number - page number)
+    for page, (first, last) in edges.items():
+        for position in {first, last}:
+            block = blocks[position]
+            match = _BARE_PAGE_NUMBER.fullmatch(block.content.strip()) if block.type == BLOCK_PARAGRAPH else None
+            if match:
+                candidates.append((position, int(match.group(1)) - page))
+
+    pages_per_offset: Dict[int, int] = defaultdict(int)
+    for _, offset in candidates:
+        pages_per_offset[offset] += 1
+    return {position for position, offset in candidates
+            if offset == 0 or pages_per_offset[offset] >= _MIN_PAGES_SHARING_OFFSET}
+
+
 def clean_blocks(blocks: Sequence[Block], page_count: Optional[int] = None) -> Tuple[List[Block], List[str]]:
     """Return (kept blocks, removal log). Input blocks are not modified."""
     normalised: List[Block] = []
@@ -80,10 +108,11 @@ def clean_blocks(blocks: Sequence[Block], page_count: Optional[int] = None) -> T
         normalised.append(block)
 
     repeated = _repeated_boilerplate(normalised, page_count)
+    page_numbers = _printed_page_numbers(normalised)
     kept: List[Block] = []
     removed: Dict[str, int] = defaultdict(int)
 
-    for block in normalised:
+    for position, block in enumerate(normalised):
         text = (block.content or "").strip()
         if block.type == BLOCK_TABLE:
             if block.table is not None or text:
@@ -95,8 +124,8 @@ def clean_blocks(blocks: Sequence[Block], page_count: Optional[int] = None) -> T
             if any(p.fullmatch(text) for p in _DENYLIST):
                 removed[f"denylist: {text}"] += 1
                 continue
-            if block.page_number is not None and _BARE_PAGE_NUMBER.fullmatch(text):
-                removed["bare page number"] += 1
+            if position in page_numbers:
+                removed["printed page number"] += 1
                 continue
             if text in repeated:
                 removed[f"running header/footer: {text}"] += 1

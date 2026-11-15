@@ -61,7 +61,7 @@ A zip archive produces one status per member.
 Removed:
 
 - Paragraphs matching `CLEAN_DENYLIST_PATTERNS` ("Page 3 of 12", rule lines, scanner stamps).
-- Bare page numbers, in documents that have pages.
+- Printed page numbers: a bare number that is the first or last block on its page and either equals the page number or follows the same offset on at least three pages. A bare number anywhere else is kept, because the cells of a table that docling failed to recognise arrive as loose numbers.
 - Running headers and footers: a paragraph of at most `CLEAN_MAX_BOILERPLATE_CHARS` characters that appears on at least `CLEAN_REPEAT_PAGE_FRACTION` of the pages, in documents of at least `CLEAN_MIN_PAGES_FOR_REPEAT` pages.
 
 Never removed by the repetition rule: headings, tables, list items, captions, footnotes, code, and value-like text such as "Nil", "N.A." or "12.5%", which repeats legitimately in filings.
