@@ -24,11 +24,11 @@ from typing import Any, Dict, List, Sequence
 
 from config.settings import SCRATCH_DIR
 from pipeline.metadata import MetadataResolver, build_source_document
-from pipeline.schema import SourceDocument
+from pipeline.schema import SourceDocument, make_chunk_id
 from pipeline.type_router import HANDLER_DOCUMENT, RoutedFile, open_routed
 from pipeline.parser import Parser
 from pipeline.cleaner import clean_blocks
-from pipeline.chunker import Chunker
+from pipeline.chunker import chunk_document, token_counter
 from pipeline.embedder import embed_chunks
 from pipeline.vector_store import VectorStore
 
@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 class Indexer:
     def __init__(self):
         self._parser = Parser()
-        self._chunker = Chunker()
 
     def index_files(self, files: Sequence[Path], root: Path) -> Dict[str, Any]:
         """
@@ -98,17 +97,15 @@ class Indexer:
         for warning in result.warnings:
             logger.warning(f"[indexer] {source_filename}: {warning}")
         blocks, _removed = clean_blocks(result.blocks, result.page_count)
-        # Legacy chunker still wants one Markdown string (replaced in the chunker rewrite).
-        text = "\n\n".join(
-            f"{'#' * max(1, b.level)} {b.content}" if b.type == "header" else b.content
-            for b in blocks if b.content.strip()
-        )
-        if not text.strip():
+        new_chunks = chunk_document(blocks, size_fn=token_counter())
+        if not new_chunks:
             return 0
-
-        chunks = self._chunker.chunk_text(text)
-        if not chunks:
-            return 0
+        # Legacy embedder/store still take dicts (replaced in Step 5).
+        chunks = [
+            {"chunk_id": make_chunk_id(doc.doc_id, c.index, c.text), "content": c.text,
+             "section_path": c.section_path or "", "page_range": c.page_range or "unknown"}
+            for c in new_chunks
+        ]
 
         now = datetime.now(timezone.utc).isoformat()
         for chunk in chunks:
