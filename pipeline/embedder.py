@@ -15,6 +15,7 @@ product. There is no deduplication here: every chunk it is given is embedded.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
@@ -56,6 +57,10 @@ class Embedder:
             self._model = model
             return
 
+        # bge-m3 ships pickled weights only. Without this, transformers starts a background
+        # thread that downloads a multi-GB safetensors conversion and keeps the process
+        # from exiting until it is done.
+        os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         from sentence_transformers import SentenceTransformer
 
         self.device = device or resolve_device()
@@ -64,7 +69,8 @@ class Embedder:
         self._model.max_seq_length = EMBED_MAX_SEQ_LENGTH
         if EMBED_FP16 and self.device == "cuda":
             self._model.half()
-        reported = self._model.get_sentence_embedding_dimension()
+        dimension = getattr(self._model, "get_embedding_dimension", None) or self._model.get_sentence_embedding_dimension
+        reported = dimension()
         if reported != EMBEDDING_DIM:
             raise ValueError(f"{EMBEDDING_MODEL} produces {reported}-dim vectors; the schema expects {EMBEDDING_DIM}")
 

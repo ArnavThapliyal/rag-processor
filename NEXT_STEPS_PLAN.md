@@ -77,6 +77,7 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
   - Hindi text: RapidOCR covers English and Chinese only;
   - very wide tables: a single row longer than `EMBED_MAX_SEQ_LENGTH` tokens is truncated at embedding;
   - heading levels from docling, which decide `section_path` and chunk boundaries.
+  - table detection: in a synthetic test PDF docling did not recognise a table drawn without grid lines, and its cells arrived as loose paragraphs (kept as prose, not as a table). Check how real filings behave.
 - [ ] Measure memory per PDF worker on the M4 Pro and set `NUM_WORKERS` accordingly. Each PDF worker loads docling's layout and table models, and unified memory is shared with the MPS embedder.
 - [ ] Measure embedding throughput on MPS and tune `EMBED_BATCH_SIZE`.
 - [ ] A small retrieval check (a handful of questions with known answers) to tune `CHUNK_SIZE_TOKENS` and `CHUNK_OVERLAP_TOKENS`.
@@ -99,7 +100,7 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
 | A file with no metadata, a corrupt file and an unsupported file each get the right status without affecting others | Met (tests) |
 | Table chunks carry `table_id`, sheet, row range and columns | Met (tests) |
 | The embedding model is loaded in exactly one process; no per-chunk or per-file encode calls | Met |
-| The same command runs unchanged on MPS, CUDA and CPU | Device selection is tested; only MPS and CPU machines were available to run on |
+| The same command runs unchanged on MPS, CUDA and CPU | Run with the real model on MPS (M4 Pro), inline and with workers. CUDA is covered only by the device-selection test |
 | No legacy module, legacy setting or `print` remains under `pipeline/` | Met |
 | Fast tests and `ruff` pass | Met locally; CI not yet observed |
-| Verified on real purchased data | **Not done** |
+| Verified on real purchased data | **Not done.** Only a synthetic sample (a generated PDF, an HTML note, a 300-row price CSV) has been run end to end with the real model |

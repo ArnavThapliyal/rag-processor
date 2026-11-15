@@ -521,8 +521,7 @@ class Indexer:
                     start_worker()  # its stop marker is still queued, so the replacement will finish cleanly
                     last_seen[next_id - 1] = time.monotonic()
 
-                if not embedder.is_alive():
-                    raise RuntimeError(f"the embedding process died (exit code {embedder.exitcode})")
+                embedder_gone = not embedder.is_alive()  # it exits right after its final message
 
                 if not workers and not stop_sent:
                     try:
@@ -534,6 +533,8 @@ class Indexer:
                 try:
                     message = out_q.get(timeout=_POLL_SECONDS)
                 except queue.Empty:
+                    if embedder_gone:  # gone, and nothing left from it to read: it did not finish normally
+                        raise RuntimeError(f"the embedding process died (exit code {embedder.exitcode})")
                     continue
                 kind = message[0]
                 if kind == MSG_CHUNKS:
