@@ -27,3 +27,5 @@ def setup_logging(run_id: Optional[str] = None, level: int = logging.INFO) -> No
     stdout_handler.setFormatter(formatter)
 
     logging.basicConfig(level=level, handlers=[file_handler, stdout_handler], force=True)
+    for noisy in ("httpx", "httpcore", "urllib3", "filelock"):  # one line per model-hub request otherwise
+        logging.getLogger(noisy).setLevel(logging.WARNING)

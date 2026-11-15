@@ -1,100 +1,136 @@
 # 4. Processing stages
 
-Each stage is described as it behaves **today**, followed by the target where the two differ. The checklist for closing each gap is in `NEXT_STEPS_PLAN.md`.
+## Process layout (`pipeline/indexer.py`)
 
-## Parser (`pipeline/parser.py`) — current
+```mermaid
+flowchart LR
+    main["main process<br/>accounting, LanceDB writes"] -->|file paths| pool["N CPU workers (spawn)<br/>route, metadata, parse,<br/>clean, chunk"]
+    pool -->|"chunk batches<br/>(bounded queue)"| emb["1 embedding process<br/>bge-m3 on cuda / mps / cpu"]
+    emb -->|"chunks + vectors<br/>(bounded queue)"| main
+```
+
+| Process | Count | Device | Does |
+|---|---|---|---|
+| Main | 1 | CPU | Starts the others, builds rows with `build_record`, writes to LanceDB, keeps the per-file accounting, builds indexes. Never imports torch. |
+| Parse/chunk worker | `NUM_WORKERS` | CPU | Everything in `pipeline/worker.py`: route, metadata, parse, clean, chunk, or stream tabular rows. |
+| Embedder | 1 | `cuda → mps → cpu` | The only process that loads bge-m3. Collects texts from all workers into one batch per encode call. |
+
+- Processes are started with `spawn`. Nothing is forked after torch or MPS is initialised.
+- Both queues are bounded (`EMBED_QUEUE_MAX_BATCHES`). When embedding is the bottleneck, workers block instead of filling memory.
+- Every message for a file travels worker → embedder → main in order, so main always receives a file's chunks before its completion message.
+- `--workers 0` (or `NUM_WORKERS=0`) runs the same steps inline in one process, for tests and debugging.
+
+### File statuses
+
+| Status | Meaning | Counts as |
+|---|---|---|
+| `indexed` | Rows written | indexed |
+| `empty` | Readable, but no text or rows | skipped |
+| `skipped_duplicate` | Same bytes already in the table, or seen earlier in this run | skipped |
+| `skipped_unsupported` | `.doc`, `.ppt`, unknown type | skipped |
+| `failed` | Any error while routing, parsing, embedding or writing | failed (exit code 1) |
+
+A zip archive produces one status per member.
+
+### Failure handling
+
+- An exception in a worker is caught per file and reported as `failed` with the reason.
+- A worker that dies (for example a crash inside a native parser) or reports nothing for `WORKER_STALL_TIMEOUT_SECONDS` fails only the file it was on. A replacement worker is started.
+- An embedding error is retried per file, so one bad text fails one file, not the whole batch.
+- If the embedding process cannot start or dies, the run stops with an error. Nothing half-written is left behind (see the vector store below).
+
+## Worker steps (`pipeline/worker.py`)
+
+`process_path(path, ctx)` yields chunk batches followed by exactly one result per routed item. It never raises for a bad file or missing metadata. Each worker keeps its own metadata cache and tokenizer, and creates the docling parser only when it meets its first document, so a worker that handles only tabular files never loads docling.
+
+## Parser (`pipeline/parser.py`)
 
 `Parser().parse(path)` returns a `ParseResult`: a list of `Block`s, the page count, the pages that were OCRed, and warnings.
 
 - Uses docling for PDF, DOCX, PPTX and HTML.
 - Block types: `header` (with level), `paragraph`, `list_item`, `table`, `caption`, `footnote`, `code`. Each block carries a `page_number`, or `None` for formats without pages.
-- Tables keep their structure as `TableData` (header + rows) in addition to Markdown text. A first row that looks like a header is promoted to the header.
+- Tables keep their structure as `TableData` (header + rows). A first row that looks like a header is promoted to the header.
 - Page headers and footers are in docling's furniture layer and are excluded.
 - **OCR is on demand.** A document is first parsed without OCR. If pages have fewer than `min_chars_per_page_before_ocr` characters and their count is within `max_pages_for_ocr`, the document is converted again with OCR (RapidOCR, torch backend). RapidOCR covers English and Chinese, not Hindi.
-- Docling runs on CPU with one thread (`PARSER_DEVICE`, `PARSER_THREADS`), so several parser processes can run side by side and the embedding process is the only user of the GPU/MPS device.
+- Docling runs on CPU with one thread (`PARSER_DEVICE`, `PARSER_THREADS`), so several workers can run side by side and the embedding process is the only user of the GPU/MPS device.
 
-## Tabular (`pipeline/tabular.py`) — current, not yet wired in
+## Cleaner (`pipeline/cleaner.py`)
 
-`read_table_chunks(path, source_type, ...)` streams a CSV, XLSX, XLS or JSON/JSONL file and yields `Chunk`s with `content_kind="table"`.
+`clean_blocks(blocks, page_count)` returns the kept blocks and a log of what was removed. It is a pure function.
 
-- Rows are grouped (`TABULAR_ROWS_PER_CHUNK`, also bounded by a size limit) and rendered as a Markdown table. A row is never split and **every chunk repeats the header row**.
-- Chunk metadata records `sheet`, `row_start`, `row_end` and `columns`, which is what a later relational load needs to find the same rows again.
+Removed:
+
+- Paragraphs matching `CLEAN_DENYLIST_PATTERNS` ("Page 3 of 12", rule lines, scanner stamps).
+- Bare page numbers, in documents that have pages.
+- Running headers and footers: a paragraph of at most `CLEAN_MAX_BOILERPLATE_CHARS` characters that appears on at least `CLEAN_REPEAT_PAGE_FRACTION` of the pages, in documents of at least `CLEAN_MIN_PAGES_FOR_REPEAT` pages.
+
+Never removed by the repetition rule: headings, tables, list items, captions, footnotes, code, and value-like text such as "Nil", "N.A." or "12.5%", which repeats legitimately in filings.
+
+Whitespace is collapsed only in running text. Tables, list items and code are left as they are. Page numbers stay on the blocks as data.
+
+## Chunker (`pipeline/chunker.py`)
+
+`chunk_document(blocks, size_fn=token_counter())` returns `schema.Chunk` objects. It is a pure function.
+
+- **Sizes are in bge-m3 tokens.** `token_counter()` loads the model's tokenizer through the `tokenizers` package, which does not import torch. If the tokenizer cannot be loaded it falls back to a character estimate and logs a warning.
+- No prose chunk exceeds `CHUNK_SIZE_TOKENS`. An oversized paragraph is split by sentence, then by word, then by character.
+- A level-1 or level-2 heading starts a new chunk. Deeper headings stay inline. A heading is never left as the last line of a chunk.
+- Consecutive chunks inside a section overlap by up to `CHUNK_OVERLAP_TOKENS`. There is no overlap across a section boundary or a table.
+- `section_path` is the heading breadcrumb where the chunk starts. `page_range` comes from the blocks the chunk contains and is null for formats without pages.
+- **Tables are never mixed into prose.** Each table goes through `tabular.table_chunks`: whole rows, header repeated in every chunk, `content_kind="table"`. A caption directly before or after the table is attached to its first chunk.
+
+## Tabular (`pipeline/tabular.py`)
+
+`read_table_chunks(path, source_type, ...)` streams a CSV, XLSX, XLS or JSON/JSONL file and yields table chunks. Memory stays bounded for large files.
+
+Two modes, chosen per sheet:
+
+| Mode | When | Chunk | Typed columns |
+|---|---|---|---|
+| Row groups | Default | Up to `TABULAR_ROWS_PER_CHUNK` whole rows as a Markdown table with the header repeated | Not filled per row |
+| Record | The header names at least `TABULAR_RECORD_MIN_MATCHES` financial columns (`trade_date`, `close`, `roe_pct`, ...) and `TABULAR_RECORD_MODE=auto` | One chunk per row, text as `column: value` lines | Filled from the row; a `symbol`/`ticker` column sets the row's `symbol` |
+
+Record mode is what puts real values into columns such as `close`. It also means one vector per row, so a large price file produces many rows in LanceDB. Set `TABULAR_RECORD_MODE=off` to always use row groups.
+
+Other behaviour:
+
 - Blank or duplicate header cells are repaired. CSV encoding falls back from UTF-8 to cp1252 to latin-1, and the delimiter is sniffed.
 - Nested JSON objects are flattened to dotted column names.
+- An unparseable CSV row or JSONL line is skipped and counted in a warning; it does not fail the file.
 - Files longer than `TABULAR_MAX_ROWS_PER_FILE` are truncated with a warning.
-- `table_chunks(table, ...)` applies the same grouping to a table found inside a document.
 
-The indexer does not call this module yet, so tabular files are currently skipped.
+### Tables stay locatable
 
-## Cleaner (`pipeline/cleaner.py`) — legacy
+Every table chunk, from a tabular file or from inside a document, carries in `metadata_json`:
 
-Today:
+| Key | Meaning |
+|---|---|
+| `table_id` | `<doc_id>:<table_ordinal>`; identical for all chunks of one table, stable across runs |
+| `table_ordinal` | Sheet number, or the table's position in the document |
+| `sheet` | Sheet name (spreadsheets) |
+| `row_start`, `row_end` | 1-based data-row range covered by the chunk |
+| `columns` | Column names (row-group chunks) |
+| `caption` | Table caption, when the document had one |
 
-- Works on dict versions of blocks (`Block.to_dict()`), then flattens everything to one Markdown string.
-- Deletes any short block (under 80 characters) that appears on three or more pages. On real filings this removes legitimate repeated content such as "Nil", "N.A." and recurring section headings.
-- Encodes page numbers into the text as `[[PAGE:n]]` markers, emitted only when the page changes, so chunks that lie within a page lose their page.
-- Renders table blocks as ordinary paragraphs.
-- Still contains file-based code paths for directories that no longer exist.
+With `content_kind="table"` and these keys, a later job can select all table chunks, or re-read exactly those rows from the source file, to load a relational store. Raw cell values are not duplicated in LanceDB.
 
-Target: operate on `Block` objects, remove repeated boilerplate only when it is frequent relative to the page count and never remove headings or tables, keep page numbers as data, and log what was removed.
+## Embedder (`pipeline/embedder.py`)
 
-## Chunker (`pipeline/chunker.py`) — legacy
+`Embedder().encode(texts)` returns a float32 matrix of shape `(n, 1024)`.
 
-Today:
+- Device: `EMBED_DEVICE` if set, otherwise `cuda`, then `mps`, then `cpu`.
+- Vectors are L2-normalised, so cosine distance equals one minus the dot product.
+- Texts are sorted by length and encoded in batches of `EMBED_BATCH_SIZE`; results come back in the input order.
+- On an out-of-memory error the batch size is halved and the batch retried; the smaller size is kept for the rest of the run.
+- Inputs longer than `EMBED_MAX_SEQ_LENGTH` tokens are truncated by the model. Prose chunks are always shorter; only a single very wide table row can reach it.
+- Half precision is used only with `EMBED_FP16=true` on CUDA.
+- Importing the module loads neither torch nor the model. There is no deduplication in the embedder.
 
-- Splits the cleaner's Markdown string by headings, then by characters (1000 characters, 100 overlap, hard-coded).
-- Produces ids of the form `md5(text)[:6]_index`, which are not document-scoped.
-- Recovers `page_range` from the `[[PAGE:n]]` markers, falling back to `"unknown"`.
-- Can split a table in the middle of a row.
+## Vector store (`pipeline/vector_store.py`)
 
-Target: a pure function over `Block`s that sizes chunks in bge-m3 tokens (`CHUNK_SIZE_TOKENS`, `CHUNK_OVERLAP_TOKENS`), sends table blocks through `tabular.table_chunks`, computes `page_range` and `section_path` from the blocks a chunk spans, and returns `schema.Chunk` objects. Ids come from `schema.make_chunk_id`.
-
-## Embedder (`pipeline/embedder.py`) — legacy
-
-Today:
-
-- Loads `BAAI/bge-m3` through sentence-transformers and checks the output is 1024-dim.
-- Device order is `mps → cuda → cpu` (the required order is `cuda → mps → cpu`).
-- Encodes in batches of 32 without normalising the vectors.
-- Drops any chunk whose text hash already exists anywhere in the table, across all documents. Identical text in two documents is therefore stored once, and a re-run returns no chunks, which the indexer reports as a failure.
-- Uses its own hard-coded database path and table name.
-
-Target: device order `cuda → mps → cpu` with an `EMBED_DEVICE` override, `normalize_embeddings=True`, length-sorted batches of `EMBED_BATCH_SIZE`, out-of-memory backoff, no chunk-level deduplication, and the model loaded in exactly one process.
-
-## Vector store (`pipeline/vector_store.py`) — legacy
-
-Today:
-
-- Writes table `company_documents` with its own schema: `content` instead of `text`, a variable-length `List[float]` vector (which cannot be ANN-indexed), no `doc_id`, and none of the financial columns.
-- Upserts with `merge_insert("chunk_id")`, once per file, opening a new connection each time.
-- Uses a path relative to the current working directory.
-- Builds filter strings by interpolating values.
-- Contains search helpers that belong to the LLM stage.
-
-Target: create or open `documents` from `ChunkRecord`, append with `table.add` in batches, build the cosine vector index and scalar indexes once per run, and expose only `count` and `get_by_doc_id` for verification.
-
-## Indexer (`pipeline/indexer.py`) — half-migrated
-
-Today `Indexer.index_files(files, root)`:
-
-- opens each file with `open_routed`, builds the `SourceDocument`, and isolates failures per file (this part is final);
-- runs document files through parser → legacy cleaner → legacy chunker → legacy embedder → legacy store, in one process;
-- counts tabular and unsupported files as skipped;
-- treats "zero chunks written" as a failure.
-
-Target: the orchestrator of a multi-process run.
-
-```mermaid
-flowchart LR
-    main["main process<br/>discover, dedup by doc_id,<br/>write to LanceDB"] -->|file paths| pool["N CPU workers (spawn)<br/>route, metadata, parse,<br/>clean, chunk"]
-    pool -->|"chunk batches<br/>(bounded queue)"| emb["1 embedding process<br/>bge-m3 on cuda/mps/cpu"]
-    emb -->|vectors| main
-```
-
-- Start method `spawn`; torch and the embedding model are never initialised before the workers start.
-- The queue between workers and the embedder is bounded (`EMBED_QUEUE_MAX_BATCHES`), so fast parsers cannot fill memory.
-- A document already present in the table (same `doc_id`) is skipped and reported as skipped, not failed.
-
-## Orphaned modules
-
-`pipeline/normalizer.py` and `pipeline/document_template/` (a four-rule regex classifier for document types) are not called by anything. They will be deleted, unless the classifier is kept as a fallback for a missing `doc_type`.
+- Opens or creates the `documents` table from `ChunkRecord`. An existing table with a different schema is refused with a message naming the differences.
+- Append-only. Rows are validated against the Arrow schema before the write.
+- **A document is written in one atomic `add` when its last chunk has arrived.** "This `doc_id` is in the table" therefore means "this document is complete", which is what makes skip-if-present safe.
+- A document with more than `WRITE_MAX_ROWS_PER_ADD` rows is written in parts. Its `doc_id` is kept in a small ledger file (`_inflight_docs.json` in the database directory) until the last part is written. If a run is killed in between, the next run deletes that document's rows before starting.
+- `finalize()` runs once per run: scalar indexes on `doc_id` and `symbol`, and the cosine vector index (IVF-PQ) once the table has at least `VECTOR_INDEX_MIN_ROWS` rows. Below that, searches are exact brute-force scans.
+- Only `count()`, `has_doc()`, `existing_doc_ids()` and `get_by_doc_id()` are provided for reading. Retrieval belongs to the LLM stage.

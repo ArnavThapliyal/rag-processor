@@ -2,8 +2,6 @@
 
 The contract with the LLM stage is defined once, in `pipeline/schema.py`, as the pydantic model `ChunkRecord`. `SCHEMA_VERSION` in `config/settings.py` is currently `2` and must be bumped when the model changes.
 
-> The legacy `vector_store.py` does not use this model yet. Until it is rewritten, a run writes the old `company_documents` table.
-
 ## Table, vector and metric
 
 | Item | Value | Defined in |
@@ -19,11 +17,12 @@ LanceDB does not record a metric in the table schema. The metric is chosen when 
 ```python
 from pipeline.schema import VECTOR_INDEX_KWARGS   # {"metric": "cosine", "vector_column_name": "embedding"}
 
-table.create_index(**VECTOR_INDEX_KWARGS)                  # Processor, once per run
 table.search(query_vector).metric("cosine").limit(10)      # LLM side
 ```
 
-A search that omits the metric on an unindexed table uses L2. Vectors will be L2-normalised at embedding time, so L2 and cosine then rank identically, but readers should still set cosine explicitly.
+The Processor builds the cosine vector index at the end of a run once the table has at least `VECTOR_INDEX_MIN_ROWS` rows; smaller tables are searched by exact scan. A search that omits the metric on an unindexed table uses L2. Vectors are L2-normalised at embedding time, so L2 and cosine rank identically, but readers should still set cosine explicitly.
+
+Query vectors must come from the same model (`BAAI/bge-m3`, dense output) and should be normalised the same way.
 
 The Arrow field for the vector is technically nullable, so `build_record` enforces the dimension: a vector that is not exactly 1024 long raises `ValueError`.
 
@@ -68,7 +67,7 @@ Re-ingesting an unchanged file with unchanged settings produces identical ids, w
 
 | Column | Type | Source |
 |---|---|---|
-| `symbol` | string | Vendor metadata only; never inferred from folder names |
+| `symbol` | string | Vendor metadata, or the row's `symbol`/`ticker` column for record-mode tabular files; never inferred from folder names |
 | `source_url` | string | Vendor metadata |
 | `doc_type` | string | Vendor metadata |
 | `vendor` | string | Vendor metadata |
@@ -103,7 +102,9 @@ The types were chosen by the Processor side because only names were specified. C
 - **Document level** (`SourceDocument.fields`): any vendor metadata key that exactly matches a column name. Applied to every chunk of the document.
 - **Chunk level** (`Chunk.fields`): values specific to one chunk. They override the document-level value.
 
-Nothing fills chunk-level values yet. Whether price and fundamentals files should be emitted as one chunk per record, so that per-row columns like `close` hold a real value, is an open decision (see `NEXT_STEPS_PLAN.md`).
+Chunk-level values come from tabular files in record mode: when a sheet's header names at least `TABULAR_RECORD_MIN_MATCHES` (default 3) of these columns, each row becomes its own chunk and its cells fill the typed columns. Header names are matched exactly, ignoring case. See [04_processing_stages.md](04_processing_stages.md).
+
+For chunks of ordinary documents (a PDF filing, a presentation) these columns hold only what the vendor metadata supplied for the whole document.
 
 #### Coercion (`coerce_extended`)
 
@@ -124,7 +125,7 @@ Coercion never raises.
 
 `build_record(doc, chunk, embedding, *, ingested_at, ingest_run_id, embedding_model, pipeline_version)` is the only place a row is assembled. It raises `ValueError` for contract violations (missing `doc_id`, empty text, wrong vector length, unknown `content_kind`) and returns a plain dict ready for `table.add`.
 
-`metadata_json` contains the document's unmapped vendor fields, the chunk's own metadata (for table chunks: sheet name, row range, column names) and any rejected financial values.
+`metadata_json` contains the document's unmapped vendor fields, the chunk's own metadata (for table chunks: `table_id`, sheet name, row range, column names) and any financial values that could not be converted.
 
 ## Authorisation compatibility
 

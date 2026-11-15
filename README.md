@@ -19,20 +19,21 @@ flowchart LR
 
 ## Status
 
-The refactor from the old scraping pipeline is in progress. Read this before relying on a run.
+All pipeline stages are implemented and covered by tests.
 
 | Part | State |
 |---|---|
-| Recursive discovery, CLI, per-file failure isolation | Working, tested |
-| Type detection, zip handling | Working, tested |
-| Document parsing (PDF, DOCX, PPTX, HTML), on-demand OCR | Working, tested |
-| Tabular reading (CSV, XLSX, XLS, JSON) into table chunks | Working, tested, **not yet wired into a run** |
-| Vendor metadata resolution | Working, tested |
-| LanceDB schema (1024-dim vector, cosine, 50 financial columns), ids | Defined and tested, **not yet what a run writes** |
-| Cleaner, chunker, embedder, vector store | **Legacy code**, pending rewrite |
-| Multiprocessing (CPU workers + one embedding process) | **Not implemented**; runs are single-process |
+| Recursive discovery, CLI, per-file failure isolation | Done |
+| Type detection, zip handling | Done |
+| Document parsing (PDF, DOCX, PPTX, HTML), on-demand OCR | Done |
+| Tabular files (CSV, XLSX, XLS, JSON), including one-row-per-record mode for price and fundamentals files | Done |
+| Vendor metadata resolution (everything optional) | Done |
+| Cleaner and token-based, table-aware chunker | Done |
+| bge-m3 embedding, normalised, `cuda → mps → cpu` | Done |
+| LanceDB `documents` table (1024-dim, cosine, 50 financial columns), append-only | Done |
+| Multiprocessing: CPU parse/chunk workers and one embedding process | Done |
 
-Until the remaining steps land, `main.py` still pushes documents through the legacy cleaner, chunker, embedder and store. That path writes the **old** table (`company_documents`, old columns, vectors not normalised), skips tabular files, and reports a re-run of already-ingested files as failures. The remaining work is itemised in [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md).
+Not yet done: a run over real purchased data, and tuning of chunk sizes against retrieval quality. See [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md).
 
 ## Setup
 
@@ -41,7 +42,7 @@ brew install libmagic        # required by python-magic (content sniffing)
 uv sync                      # creates .venv from uv.lock (Python 3.11)
 ```
 
-The first run that parses a PDF downloads docling's layout and table models; the first embedding run downloads `BAAI/bge-m3`.
+The first run that parses a PDF downloads docling's layout and table models; the first embedding run downloads `BAAI/bge-m3` (about 2.3 GB) into the Hugging Face cache.
 
 ## Usage
 
@@ -49,11 +50,16 @@ The first run that parses a PDF downloads docling's layout and table models; the
 uv run python main.py /path/to/purchased/data   # a directory, crawled recursively
 uv run python main.py /path/to/one/file.pdf     # or a single file
 uv run python main.py                           # defaults to data/input
+
+uv run python main.py /path/to/data --dry-run   # only list what would be processed or skipped
+uv run python main.py /path/to/data --workers 4 # number of parse/chunk processes (0 = single process)
 ```
 
 - There is **no required folder structure**. Folder names and depth carry no meaning.
 - File types are detected from file content, with the extension as a hint. A PDF in a folder named `csv` is still a PDF.
 - One bad file never stops the run. The exit code is `1` if any file failed, otherwise `0`.
+- Running the same folder again is safe: files already in the table are skipped, not duplicated and not reported as failures.
+- The same file delivered under two paths is ingested once.
 - Logs go to stdout and `data/logs/pipeline.log`.
 
 ### What is skipped during discovery
@@ -106,8 +112,8 @@ The embedding device is chosen automatically in the order `cuda → mps → cpu`
 ## Tests
 
 ```bash
-uv run pytest               # 48 fast tests, no model downloads
-RUN_SLOW=1 uv run pytest    # also the 2 docling PDF/OCR tests (downloads models once)
+uv run pytest               # fast tests; the embedding model is stubbed, nothing is downloaded
+RUN_SLOW=1 uv run pytest    # also the docling PDF/OCR tests and the real bge-m3 test (downloads models once)
 ```
 
 The `.rego` files under `tests/` are OPA policies for the LLM side and are run by `.github/workflows/opatest.yml`. They are kept here because the schema's `allowed_roles` column must stay compatible with them.
@@ -119,9 +125,9 @@ The `.rego` files under `tests/` are OPA policies for the LLM side and are run b
 | [Doc/current/01_overview.md](Doc/current/01_overview.md) | Scope, data flow, module map |
 | [Doc/current/02_ingestion_workflow.md](Doc/current/02_ingestion_workflow.md) | Discovery, routing, metadata, failure model |
 | [Doc/current/03_schema.md](Doc/current/03_schema.md) | LanceDB columns, ids, vector and metric, financial fields |
-| [Doc/current/04_processing_stages.md](Doc/current/04_processing_stages.md) | Parser, tabular, cleaner, chunker, embedder, store |
+| [Doc/current/04_processing_stages.md](Doc/current/04_processing_stages.md) | Process layout, parser, cleaner, chunker, tabular, embedder, store |
 | [Doc/current/05_configuration.md](Doc/current/05_configuration.md) | Settings and environment variables |
 | [Doc/current/06_development.md](Doc/current/06_development.md) | Repo layout, tests, conventions |
-| [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md) | File-by-file checklist for the remaining work |
+| [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md) | What was implemented, and what remains |
 | [HANDOFF.md](HANDOFF.md) | Session-to-session progress notes |
 | [refactoring_flags.md](refactoring_flags.md) | The original audit and approved plan |

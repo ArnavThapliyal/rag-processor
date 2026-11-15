@@ -1915,6 +1915,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "docling" },
     { name = "lancedb" },
+    { name = "numpy" },
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "pyarrow" },
@@ -1936,6 +1937,7 @@ dev = [
 requires-dist = [
     { name = "docling", specifier = ">=2.109.0" },
     { name = "lancedb", specifier = ">=0.34.0" },
+    { name = "numpy", specifier = ">=2.4.6" },
     { name = "openpyxl", specifier = ">=3.1.0" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "pyarrow", specifier = ">=19.0.0" },

@@ -3,21 +3,30 @@
 ## Command
 
 ```bash
-uv run python main.py [ROOT]
+uv run python main.py [ROOT] [--workers N] [--dry-run]
 ```
+
+| Option | Effect |
+|---|---|
+| `--workers N` | Number of parse/chunk processes. Defaults to `NUM_WORKERS`. `0` runs everything in one process. |
+| `--dry-run` | Discover and detect file types only. Prints what would be processed and what would be skipped, with reasons. Nothing is parsed, embedded or written. |
 
 `ROOT` is a directory or a single file. It defaults to `INPUT_DIR` (`data/input`). If ROOT does not exist, the command prints an error and exits with code 1 before creating anything.
 
-Each invocation is one batch run. The run prints a one-line summary and a list of failed files:
+Each invocation is one batch run with its own run id, which appears on every log line and in the `ingest_run_id` column. The run prints a summary and a list of failed files:
 
 ```
-3 file(s) found under /data/vendor_drop: 1 indexed, 0 failed, 2 skipped | chunks written: 42
+7 file(s) found under /data/vendor_drop: 4 indexed, 1 failed, 2 skipped | chunks written: 318
+By status: indexed: 4, skipped_duplicate: 1, skipped_unsupported: 1, failed: 1
+Indexed by type: csv: 1, html: 1, pdf: 2
+Failed: broken.docx
+Run id: 3f9c2a71d0be
 ```
 
 | Exit code | Meaning |
 |---|---|
-| 0 | No file failed (skipped files do not count as failures) |
-| 1 | At least one file failed, ROOT is missing, or the run was interrupted |
+| 0 | No file failed. Skipped files (already ingested, unsupported, empty) do not count as failures |
+| 1 | At least one file failed, ROOT is missing, the index refresh failed, or the run was interrupted |
 
 ## Discovery (`pipeline.pipeline.discover_files`)
 
@@ -30,7 +39,7 @@ A path is **not** ingested when it is:
 - inside the pipeline's working directories (`SCRATCH_DIR`, `LOG_DIR`, `LANCEDB_PATH`), which matters when ROOT is the data directory itself;
 - a metadata file: `*.meta.json`, `metadata.json`, `manifest.json`.
 
-Folder names and nesting depth are ignored. Identical files at two different paths are currently both ingested; document-level deduplication is planned.
+Folder names and nesting depth are ignored.
 
 ## Routing (`pipeline.type_router`)
 
@@ -91,17 +100,19 @@ Field mapping (case-insensitive):
 
 Everything else, including the vendor's own document id, is stored in `metadata_json`. A financial value that cannot be converted to its column type becomes null and the original value is kept in `metadata_json`.
 
+## Deduplication and re-runs
+
+`doc_id` is the hash of the file's bytes, so:
+
+- A file already in the table is skipped (`skipped_duplicate`). Re-running a folder writes nothing new and exits 0.
+- The same bytes at two paths, or under two names, are ingested once per run; the second copy is reported as a duplicate of the first.
+- A file whose content changed gets a new `doc_id` and is ingested as a new document. The old version is not removed (append-only).
+
 ## Failure model
 
-- Failures are isolated per file. An exception while routing or processing one file is logged with a traceback and the run continues.
-- Unsupported files are **skipped**, not failed.
-- The run summary lists `files_found`, `files_indexed`, `files_failed`, `files_skipped`, `chunks_written` and `failed_files`.
+- Failures are isolated per file. The reason is logged and shown in the summary, and the run continues.
+- Unsupported, empty and already-ingested files are **skipped**, not failed.
+- A document is written only when it has been processed completely, so a failed file leaves no rows behind.
+- If a run is killed, the next run first removes any document that was left half-written, then carries on. Files completed before the kill are skipped as duplicates.
 
-## Current limitations
-
-These are properties of the half-migrated indexer, not of the design. All are covered in `NEXT_STEPS_PLAN.md`.
-
-- Tabular files are routed correctly but then counted as skipped; they are not ingested yet.
-- A file whose chunks are all already in the table is reported as **failed**, so re-running a batch exits with code 1.
-- Rows are written by the legacy store into the old table, not the schema in [03_schema.md](03_schema.md).
-- Runs are single-process.
+Details of the process layout and failure handling are in [04_processing_stages.md](04_processing_stages.md).

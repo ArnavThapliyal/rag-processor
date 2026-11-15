@@ -2,8 +2,6 @@
 
 All configuration is in `config/settings.py`. Each setting below can be overridden by an environment variable **of the same name**, unless marked fixed. Importing the module creates no directories; `main.py` calls `ensure_dirs()` after argument parsing.
 
-> One exception today: a block marked `LEGACY` at the bottom of the file still creates `data/raw`, `data/transient`, `data/cleaned`, `data/chunked` and `data/done` at import time for the old cleaner and chunker. It disappears with those modules.
-
 ## Paths
 
 | Setting | Default | Purpose |
@@ -30,7 +28,9 @@ All configuration is in `config/settings.py`. Each setting below can be overridd
 | `EMBED_DEVICE` | unset | Unset means auto: `cuda → mps → cpu`. Set `cuda`, `mps` or `cpu` to force |
 | `EMBED_BATCH_SIZE` | `64` | Texts per encode call |
 | `EMBED_FP16` | `false` | Off until bge-m3 quality in half precision is checked |
-| `EMBED_QUEUE_MAX_BATCHES` | `8` | Capacity of the worker → embedder queue (backpressure) |
+| `EMBED_QUEUE_MAX_BATCHES` | `8` | Capacity of the worker → embedder and embedder → main queues (backpressure) |
+| `EMBED_MAX_SEQ_LENGTH` | `1024` | Longest input, in tokens, the model encodes; longer text is truncated |
+| `MPS_EMPTY_CACHE_EVERY` | `50` | Encode calls between MPS cache releases |
 
 ## Chunking
 
@@ -40,13 +40,32 @@ All configuration is in `config/settings.py`. Each setting below can be overridd
 | `CHUNK_OVERLAP_TOKENS` | `64` | |
 | `TABULAR_ROWS_PER_CHUNK` | `40` | Maximum rows per table chunk |
 | `TABULAR_MAX_ROWS_PER_FILE` | `2000000` | Rows beyond this are dropped with a warning |
+| `TABULAR_RECORD_MODE` | `auto` | `auto`: one chunk per row for price/fundamentals-style tables. `off`: always row groups |
+| `TABULAR_RECORD_MIN_MATCHES` | `3` | Header names that must match financial columns for record mode |
+
+## Cleaning
+
+| Setting | Default | Notes |
+|---|---|---|
+| `CLEAN_MIN_PAGES_FOR_REPEAT` | `8` | Shorter documents are never scanned for running headers/footers |
+| `CLEAN_REPEAT_PAGE_FRACTION` | `0.4` | Share of pages a short paragraph must appear on to be removed |
+| `CLEAN_MAX_BOILERPLATE_CHARS` | `80` | Longer paragraphs are never treated as boilerplate |
+| `CLEAN_DENYLIST_PATTERNS` | see file | Whole-paragraph regexes that are always removed (not env-overridable) |
 
 ## Parallelism
 
 | Setting | Default | Notes |
 |---|---|---|
 | `MP_START_METHOD` | `spawn` | Fixed. Forking after torch/MPS initialises is unsafe on macOS |
-| `NUM_WORKERS` | CPU count − 2 | Parse/chunk workers. Two cores are left for the main and embedding processes |
+| `NUM_WORKERS` | CPU count − 2 | Parse/chunk workers. Two cores are left for the main and embedding processes. `0` = single process |
+| `WORKER_STALL_TIMEOUT_SECONDS` | `1800` | A worker silent for this long is killed and its file marked failed. `0` disables |
+
+## Writing
+
+| Setting | Default | Notes |
+|---|---|---|
+| `WRITE_MAX_ROWS_PER_ADD` | `20000` | A document with more rows is written in parts, tracked by the ledger |
+| `VECTOR_INDEX_MIN_ROWS` | `50000` | The vector index is built once the table reaches this size |
 
 ## Parsing
 
@@ -82,11 +101,11 @@ The code is the same on every machine; only environment variables differ.
 
 | Machine | Suggested overrides |
 |---|---|
-| Apple Silicon (M4 Pro) | None. Device resolves to `mps` |
+| Apple Silicon (M4 Pro) | None. Device resolves to `mps`. Each PDF worker holds docling's models in memory, so lower `NUM_WORKERS` if memory is tight |
 | CUDA server | None for the device. Consider a larger `EMBED_BATCH_SIZE`, and `EMBED_FP16=true` after a quality check |
 | CPU only | Lower `EMBED_BATCH_SIZE`; expect slow embedding |
 
-Until `embedder.py` is rewritten, `EMBED_DEVICE`, `EMBED_BATCH_SIZE`, `LANCEDB_PATH` and `LANCEDB_TABLE` are not honoured by the legacy embedder and store.
+Child processes are started with `spawn` and read their settings from the environment again, so always configure through environment variables, not by editing values at runtime.
 
 ## System dependency
 

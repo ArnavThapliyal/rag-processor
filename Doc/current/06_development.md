@@ -7,30 +7,35 @@ brew install libmagic
 uv sync                 # Python 3.11, dependencies from uv.lock
 ```
 
-Runtime dependencies: `docling`, `lancedb`, `sentence-transformers`, `torch`, `pandas`, `pyarrow`, `openpyxl`, `xlrd`, `python-magic`, `pyyaml`, `tabulate`, `langchain-text-splitters` (used only by the legacy chunker). Dev: `pytest`, `ruff`, `reportlab` (builds PDF fixtures).
+Runtime dependencies: `docling`, `lancedb`, `sentence-transformers`, `torch`, `tokenizers`, `numpy`, `pandas`, `pyarrow`, `openpyxl`, `xlrd`, `python-magic`. Dev: `pytest`, `ruff`, `reportlab` (builds PDF fixtures).
 
-No scraping libraries are declared. `beautifulsoup4`, `httpx` and `tenacity` still appear in `uv.lock` because docling, huggingface-hub and langchain-core depend on them.
+No scraping libraries are declared. `beautifulsoup4`, `httpx` and `tenacity` still appear in `uv.lock` because docling and huggingface-hub depend on them.
 
 ## Repository layout
 
 ```
 main.py                     CLI entry point
 config/settings.py          configuration
+config/logsetup.py          logging for all processes
 pipeline/
-  pipeline.py               discovery + PipelineRunner
+  pipeline.py               discovery, dry run, PipelineRunner
+  indexer.py                process orchestration, accounting, writes
+  worker.py                 per-file CPU work (runs in worker processes)
   type_router.py            type detection, zip handling
   metadata.py               vendor metadata -> SourceDocument
   parser.py                 docling -> Blocks
-  tabular.py                csv/xlsx/xls/json -> table Chunks
+  cleaner.py                boilerplate removal
+  chunker.py                Blocks -> Chunks
+  tabular.py                csv/xlsx/xls/json and in-document tables -> table Chunks
+  embedder.py               bge-m3 vectors
+  vector_store.py           LanceDB writer
   schema.py                 ChunkRecord, ids, build_record, parser IR
-  indexer.py                per-file orchestration
-  cleaner.py chunker.py embedder.py vector_store.py     legacy, pending rewrite
-  normalizer.py document_template/                      orphaned
 tests/
   test_*.py                 Processor tests
+  stub_embedder.py          deterministic stand-in for the embedding model
   *.rego                    OPA policies owned by the LLM stage
 Doc/current/                this documentation
-NEXT_STEPS_PLAN.md          remaining work
+NEXT_STEPS_PLAN.md          implemented work and what remains
 HANDOFF.md                  progress notes between sessions
 refactoring_flags.md        original audit and plan
 ```
@@ -38,8 +43,8 @@ refactoring_flags.md        original audit and plan
 ## Tests
 
 ```bash
-uv run pytest               # 48 tests, a few seconds, no model downloads
-RUN_SLOW=1 uv run pytest    # plus 2 tests that run docling on real PDFs (text + scanned)
+uv run pytest               # fast tests, no model downloads
+RUN_SLOW=1 uv run pytest    # plus docling on real PDFs (text + scanned) and the real bge-m3 model
 ```
 
 | File | Covers |
@@ -47,14 +52,19 @@ RUN_SLOW=1 uv run pytest    # plus 2 tests that run docling on real PDFs (text +
 | `test_schema.py` | ids, 1024-dim fixed vector, cosine, LanceDB round-trip with and without metadata, the 50 financial columns, coercion |
 | `test_type_router.py` | content sniffing, mislabelled files, zip lifetime and safety |
 | `test_metadata.py` | missing/malformed metadata, aliases, precedence, nearest-directory resolution |
-| `test_tabular.py` | header repetition, whole rows, encodings, truncation |
+| `test_tabular.py` | header repetition, whole rows, encodings, truncation, record mode, table ordinals, bad rows |
 | `test_parser.py` | DOCX and HTML block mapping (no models needed) |
-| `test_parser_pdf.py` | PDF tables and OCR (slow, gated by `RUN_SLOW=1`) |
-| `test_pipeline.py` | discovery on an irregular tree, run summary, routing by content, failure isolation |
+| `test_parser_pdf.py` | PDF tables and OCR (slow) |
+| `test_cleaner.py` | running footers removed only on long documents; values, headings and tables kept |
+| `test_chunker.py` | token limits, overlap, section paths, table isolation, page ranges |
+| `test_embedder.py` | order, normalisation, out-of-memory backoff, device order, no torch at import; real model (slow) |
+| `test_vector_store.py` | create/reopen, schema mismatch refused, id validation, crash recovery, cosine index |
+| `test_pipeline.py` | discovery on an irregular tree, dry run, run summary |
+| `test_indexer_e2e.py` | full runs into LanceDB, inline and multi-process: mixed tree, re-run, duplicates, large documents, embedding failures |
 
-There are no tests yet for the cleaner, chunker, embedder, store, or a full run into LanceDB.
+End-to-end tests replace the model with `tests/stub_embedder.py`, which returns a fixed unit vector per text. The multi-process test starts real worker and embedder processes with `spawn`.
 
-CI: `.github/workflows/opatest.yml` runs the OPA policy tests. `.github/workflows/pipeline-test.yml` is empty; a `ruff` + `pytest` workflow is planned.
+CI: `.github/workflows/pipeline-test.yml` runs `ruff` and the fast tests. `.github/workflows/opatest.yml` runs the OPA policy tests.
 
 ## Conventions
 
