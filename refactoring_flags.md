@@ -192,3 +192,6 @@ Dynamic: `metadata_json` (string) holds every extra vendor field and is never dr
 - **OCR** uses RapidOCR (torch backend); EasyOCR was never installed. `ocr_languages` setting removed.
 - **Step 4 must also:** consume `Block` objects (drop the dict-based `clean_ir_blocks` path), call `tabular.table_chunks` for `BLOCK_TABLE` blocks, add `tiktoken`/HF-tokenizer sizing, and carry `page_number` as structured data.
 - **Step 6 must also:** wire `tabular.read_table_chunks` and `metadata.build_source_document` into the indexer, and remove the unit-name-as-`symbol` shim.
+
+- **Recursive ingestion (2026-11-11).** `main.py ROOT` crawls any tree with `rglob`; the unit/subdirectory concept is gone. `Indexer.index_files(files, root)` replaces `index_symbol`. Step 6 builds on `index_files`, not `index_symbol`.
+- **50 LLM columns (2026-11-11).** Added to `ChunkRecord` as nullable columns (`schema.EXTENDED_FIELDS`); Step 5's `vector_store.py` must write them via `schema.build_record`.
