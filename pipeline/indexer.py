@@ -29,7 +29,7 @@ from pipeline.type_router import HANDLER_DOCUMENT, RoutedFile, open_routed
 from pipeline.parser import Parser
 from pipeline.cleaner import clean_blocks
 from pipeline.chunker import chunk_document, token_counter
-from pipeline.embedder import embed_chunks
+from pipeline.embedder import Embedder
 from pipeline.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 class Indexer:
     def __init__(self):
         self._parser = Parser()
+        self._embedder: Embedder | None = None  # loaded on first use
 
     def index_files(self, files: Sequence[Path], root: Path) -> Dict[str, Any]:
         """
@@ -120,6 +121,9 @@ class Indexer:
                 "section_path": chunk.get("section_path", ""),
             }
 
-        embedded = embed_chunks(chunks)
+        if self._embedder is None:
+            self._embedder = Embedder()
+        vectors = self._embedder.encode([c["content"] for c in chunks])
+        embedded = [{**c, "embedding": v.tolist()} for c, v in zip(chunks, vectors)]
         VectorStore().run(embedded, symbol)
         return len(embedded)
