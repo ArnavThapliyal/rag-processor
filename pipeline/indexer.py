@@ -27,7 +27,7 @@ from pipeline.metadata import MetadataResolver, build_source_document
 from pipeline.schema import SourceDocument
 from pipeline.type_router import HANDLER_DOCUMENT, RoutedFile, open_routed
 from pipeline.parser import Parser
-from pipeline.cleaner import Cleaner
+from pipeline.cleaner import clean_blocks
 from pipeline.chunker import Chunker
 from pipeline.embedder import embed_chunks
 from pipeline.vector_store import VectorStore
@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 class Indexer:
     def __init__(self):
         self._parser = Parser()
-        self._cleaner = Cleaner()
         self._chunker = Chunker()
 
     def index_files(self, files: Sequence[Path], root: Path) -> Dict[str, Any]:
@@ -98,12 +97,12 @@ class Indexer:
         result = self._parser.parse(item.path)
         for warning in result.warnings:
             logger.warning(f"[indexer] {source_filename}: {warning}")
-        ir_blocks: list[dict[Any, Any]] = [b.to_dict() for b in result.blocks]  # dict form for the old cleaner (Step 4)
-        if not ir_blocks:
-            return 0
-
-        cleaned_blocks = self._cleaner.clean_ir_blocks(ir_blocks)
-        text = self._cleaner.render_blocks_to_text(cleaned_blocks)
+        blocks, _removed = clean_blocks(result.blocks, result.page_count)
+        # Legacy chunker still wants one Markdown string (replaced in the chunker rewrite).
+        text = "\n\n".join(
+            f"{'#' * max(1, b.level)} {b.content}" if b.type == "header" else b.content
+            for b in blocks if b.content.strip()
+        )
         if not text.strip():
             return 0
 

@@ -52,6 +52,10 @@ EMBED_DEVICE: Optional[str] = _env("EMBED_DEVICE", None) or None  # None -> auto
 EMBED_BATCH_SIZE = _env("EMBED_BATCH_SIZE", 64, int)
 EMBED_FP16 = _env_bool("EMBED_FP16", False)  # off until bge-m3 quality in fp16 is checked
 EMBED_QUEUE_MAX_BATCHES = _env("EMBED_QUEUE_MAX_BATCHES", 8, int)  # backpressure between workers and embedder
+# Longest input the model is asked to encode. Prose chunks stay under CHUNK_SIZE_TOKENS;
+# the headroom is for a single table row too wide to split.
+EMBED_MAX_SEQ_LENGTH = _env("EMBED_MAX_SEQ_LENGTH", 1024, int)
+MPS_EMPTY_CACHE_EVERY = _env("MPS_EMPTY_CACHE_EVERY", 50, int)  # encode calls between torch.mps.empty_cache()
 
 # ---- chunking ---------------------------------------------------------------
 
@@ -63,6 +67,25 @@ CHUNK_OVERLAP_TOKENS = _env("CHUNK_OVERLAP_TOKENS", 64, int)
 # Tabular sources (csv/xlsx/json). Chunks are whole row groups with the header repeated.
 TABULAR_ROWS_PER_CHUNK = _env("TABULAR_ROWS_PER_CHUNK", 40, int)
 TABULAR_MAX_ROWS_PER_FILE = _env("TABULAR_MAX_ROWS_PER_FILE", 2_000_000, int)
+# 'auto': a table whose header names at least TABULAR_RECORD_MIN_MATCHES of the
+# downstream-LLM columns (trade_date, close, roe_pct, ...) is emitted one chunk per
+# row with those typed columns filled. 'off': always row groups.
+TABULAR_RECORD_MODE = _env("TABULAR_RECORD_MODE", "auto", str)
+TABULAR_RECORD_MIN_MATCHES = _env("TABULAR_RECORD_MIN_MATCHES", 3, int)
+
+# ---- cleaning ---------------------------------------------------------------
+
+# A short paragraph repeated on this fraction of pages is treated as a running
+# header/footer, but only in documents long enough for repetition to mean something.
+CLEAN_MIN_PAGES_FOR_REPEAT = _env("CLEAN_MIN_PAGES_FOR_REPEAT", 8, int)
+CLEAN_REPEAT_PAGE_FRACTION = _env("CLEAN_REPEAT_PAGE_FRACTION", 0.4, float)
+CLEAN_MAX_BOILERPLATE_CHARS = _env("CLEAN_MAX_BOILERPLATE_CHARS", 80, int)
+# Whole-block regexes (case-insensitive) that are always noise.
+CLEAN_DENYLIST_PATTERNS = (
+    r"page\s+\d+(\s+of\s+\d+)?",
+    r"[._\-–—=*]{5,}",
+    r"scanned (with|by) camscanner",
+)
 
 # ---- parallelism ----------------------------------------------------------------
 
@@ -70,7 +93,19 @@ TABULAR_MAX_ROWS_PER_FILE = _env("TABULAR_MAX_ROWS_PER_FILE", 2_000_000, int)
 MP_START_METHOD = "spawn"
 # Parsing/chunking workers. Reserve two cores: one for the main process and
 # one for the single embedding process, which owns the device.
+# 0 runs everything inline in one process (tests, debugging).
 NUM_WORKERS = _env("NUM_WORKERS", max(1, (os.cpu_count() or 4) - 2), int)
+# A worker that reports nothing for this long is killed and its file marked failed. 0 disables.
+WORKER_STALL_TIMEOUT_SECONDS = _env("WORKER_STALL_TIMEOUT_SECONDS", 1800, int)
+
+# ---- writing ----------------------------------------------------------------
+
+# A document's rows are written in one atomic add. Documents larger than this
+# are written in parts and tracked in a ledger so a crash never leaves a
+# half-written document looking complete.
+WRITE_MAX_ROWS_PER_ADD = _env("WRITE_MAX_ROWS_PER_ADD", 20_000, int)
+# Below this many rows a brute-force scan is exact and fast; no ANN index is built.
+VECTOR_INDEX_MIN_ROWS = _env("VECTOR_INDEX_MIN_ROWS", 50_000, int)
 
 # ---- parsing ----------------------------------------------------------------
 
@@ -103,30 +138,3 @@ def ensure_dirs() -> None:
     """Create working directories. Called explicitly; never at import time."""
     for path in (DATA_DIR, INPUT_DIR, SCRATCH_DIR, LOG_DIR, LANCEDB_PATH):
         path.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================================
-# LEGACY — consumed by pre-refactor modules (cleaner, chunker, indexer).
-# Removed together with those code paths in Steps 4-6. Do not use in new code.
-# ============================================================================
-
-RAW_NUMERIC = BASE_DIR / "data" / "raw" / "numeric"
-RAW_DOCUMENTS = BASE_DIR / "data" / "raw" / "documents"
-TRANS_NUMERIC = BASE_DIR / "data" / "transient" / "numeric"
-TRANS_DOCUMENTS = BASE_DIR / "data" / "transient" / "documents"
-CLEANED_NUMERIC = BASE_DIR / "data" / "cleaned" / "numeric"
-CLEANED_DOCUMENTS = BASE_DIR / "data" / "cleaned" / "documents"
-CHUNKED = BASE_DIR / "data" / "chunked"
-DONE = BASE_DIR / "data" / "done"
-
-for _legacy_path in [
-    RAW_NUMERIC,
-    RAW_DOCUMENTS,
-    TRANS_NUMERIC,
-    TRANS_DOCUMENTS,
-    CLEANED_NUMERIC,
-    CLEANED_DOCUMENTS,
-    CHUNKED,
-    DONE,
-]:
-    _legacy_path.mkdir(parents=True, exist_ok=True)

@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Tuple
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
-from config.settings import CLEANED_DOCUMENTS, CHUNKED
 logger = logging.getLogger(__name__)
 
 HEADERS_TO_SPLIT_ON = [
@@ -81,48 +80,6 @@ class Chunker:
             return clean, "unknown"
         lo, hi = min(pages), max(pages)
         return clean, (str(lo) if lo == hi else f"{lo}-{hi}")
-
-    def run(self, symbol: str) -> Dict[str, Any]:
-        input_dir = CLEANED_DOCUMENTS / symbol
-        output_dir = CHUNKED / symbol
-
-        if not input_dir.exists():
-            logger.warning(f"[chunker] [{symbol}] no cleaned input found at {input_dir}")
-            return {"status": "no_data", "chunks_written": 0}
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"[chunker] [{symbol}] starting chunking")
-
-        files_processed = 0
-        total_chunks = 0
-        for file_path in sorted(input_dir.iterdir()):
-            if file_path.is_file() and file_path.suffix == ".txt":
-                total_chunks += self._chunk_file(file_path, output_dir)
-                files_processed += 1
-
-        logger.info(
-            f"[chunker] [{symbol}] completed chunking — "
-            f"{total_chunks} chunks across {files_processed} file(s)"
-        )
-
-        if files_processed == 0:
-            return {"status": "no_data", "chunks_written": 0}
-        return {"status": "success", "chunks_written": total_chunks, "files_processed": files_processed}
-
-    def _chunk_file(self, file_path: Path, output_dir: Path) -> int:
-        """[DEBUG/legacy path] Chunk one cleaned .txt file, write result to disk. Returns chunk count."""
-        content = file_path.read_text()
-        chunks = self.chunk_text(content)
-
-        if not chunks:
-            return 0
-
-        chunk_data = {"original_file": file_path.name, "chunks": chunks}
-        output_file = output_dir / f"{file_path.stem}_chunks.json"
-        with open(output_file, 'w') as f:
-            json.dump(chunk_data, f, indent=2)
-
-        return len(chunks)
 
     def chunk_text(self, text: str) -> List[Dict[str, Any]]:
         """
