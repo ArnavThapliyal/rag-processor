@@ -59,9 +59,12 @@ def test_xlsx_multi_sheet_numbers_chunks_consecutively(tmp_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "Q1"
-    ws.append(["name", "revenue"]); ws.append(["A", 100.0]); ws.append(["B", 2.5])
+    ws.append(["name", "revenue"])
+    ws.append(["A", 100.0])
+    ws.append(["B", 2.5])
     ws2 = wb.create_sheet("Q2")
-    ws2.append(["name", "revenue"]); ws2.append(["C", 7])
+    ws2.append(["name", "revenue"])
+    ws2.append(["C", 7])
     p = tmp_path / "a.xlsx"
     wb.save(p)
     chunks = read(p, "xlsx")

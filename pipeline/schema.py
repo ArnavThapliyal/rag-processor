@@ -303,15 +303,6 @@ class Block:
     table: Optional[TableData] = None  # set for BLOCK_TABLE
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Dict form used by the pre-refactor cleaner (removed in Step 4)."""
-        return {
-            "type": self.type,
-            "content": self.content,
-            "page_number": self.page_number,
-            "hierarchical_level": self.level,
-        }
-
 
 @dataclass
 class ParseResult:
