@@ -96,7 +96,7 @@ ZIP_MAX_DEPTH = _env("ZIP_MAX_DEPTH", 3, int)
 # ---- provenance ---------------------------------------------------------------
 
 PIPELINE_VERSION = "0.1.0"  # bump when parse/clean/chunk behaviour changes
-SCHEMA_VERSION = 1          # bump when the LanceDB schema in pipeline/schema.py changes
+SCHEMA_VERSION = 2          # bump when the LanceDB schema in pipeline/schema.py changes
 
 
 def ensure_dirs() -> None:

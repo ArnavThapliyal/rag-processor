@@ -85,3 +85,53 @@ def test_identical_bytes_share_a_doc_id(tmp_path):
     a = build_source_document(routed(make_file(tmp_path, "a.pdf")))
     b = build_source_document(routed(make_file(tmp_path, "b.pdf")))
     assert a.doc_id == b.doc_id
+
+
+# ---- downstream-LLM fields and arbitrary directory trees ----------------------------
+
+def test_extended_fields_are_typed_and_bad_values_become_null_but_are_kept(tmp_path):
+    p = make_file(tmp_path)
+    (tmp_path / "r.pdf.meta.json").write_text(json.dumps({
+        "ISIN": "INE002A01018", "close": "1,200.5", "is_fno": "yes", "roe_pct": "n/a", "no_of_trades": "42",
+    }))
+    doc = build_source_document(routed(p), BatchMetadata(tmp_path))
+    assert doc.fields == {"isin": "INE002A01018", "close": 1200.5, "is_fno": True, "no_of_trades": 42}
+    assert doc.extra == {"roe_pct": "n/a"}  # unconvertible: null column, original value preserved
+
+
+def test_resolver_nearest_directory_wins_and_folder_names_carry_no_meaning(tmp_path):
+    from pipeline.metadata import MetadataResolver
+
+    deep = tmp_path / "TCS" / "2025" / "q2"          # folder names look like metadata; must be ignored
+    deep.mkdir(parents=True)
+    (tmp_path / "metadata.json").write_text(json.dumps({"defaults": {"vendor": "root_vendor", "sector": "root_sector"}}))
+    (tmp_path / "TCS" / "metadata.json").write_text(json.dumps({"defaults": {"sector": "mid_sector"}}))
+    (deep / "metadata.json").write_text(json.dumps({"files": {"r.pdf": {"industry": "leaf_industry"}}}))
+    p = make_file(deep)
+    sibling = make_file(deep, "other.pdf")
+
+    resolver = MetadataResolver(tmp_path)
+    doc = build_source_document(routed(p), resolver)
+    assert doc.vendor == "root_vendor"                 # inherited from the root
+    assert doc.fields["sector"] == "mid_sector"        # nearer directory overrides the root
+    assert doc.fields["industry"] == "leaf_industry"   # per-file entry in the leaf
+    assert doc.symbol is None                          # the 'TCS' folder name is NOT used
+    other = build_source_document(routed(sibling), resolver)
+    assert "industry" not in other.fields
+
+
+def test_resolver_ignores_metadata_outside_its_root(tmp_path):
+    from pipeline.metadata import MetadataResolver
+
+    (tmp_path / "metadata.json").write_text(json.dumps({"defaults": {"vendor": "outside"}}))
+    inner = tmp_path / "ingest"
+    inner.mkdir()
+    doc = build_source_document(routed(make_file(inner)), MetadataResolver(inner))
+    assert doc.vendor is None
+
+
+def test_is_metadata_file():
+    from pipeline.metadata import is_metadata_file
+
+    assert all(is_metadata_file(Path(n)) for n in ("a.pdf.meta.json", "A.META.JSON", "metadata.json", "manifest.json"))
+    assert not any(is_metadata_file(Path(n)) for n in ("prices.json", "report.pdf", "metadata.csv"))

@@ -7,15 +7,21 @@ Metadata is looked up in this order, later entries filling only what earlier
 ones left empty:
 
   1. Sidecar next to the file:  <filename>.meta.json   (e.g. report.pdf.meta.json)
-  2. Batch file in the unit directory (metadata.json, or the legacy manifest.json):
+  2. Batch file (metadata.json, or the legacy manifest.json) in the file's directory
+     or any parent directory up to the ingest root; the nearest one wins:
          {"defaults": {...applied to every file...},
           "files": {"<filename>": {...}}}
      The legacy crawler shape {"downloaded_files": [{"file": ..., "url": ...}]}
      is still understood and supplies source_url only.
 
 Vendors name fields differently; _ALIASES maps the common spellings onto our
-columns. Anything unrecognised is kept under SourceDocument.extra (stored in
-metadata_json), never dropped.
+columns, and any key that is exactly one of schema.EXTENDED_FIELDS (isin, close,
+roe_pct, ...) fills that typed column. Anything unrecognised is kept under
+SourceDocument.extra (stored in metadata_json), never dropped. Folder names are
+never read as metadata.
+
+Sidecar and batch files are metadata, not documents: use is_metadata_file() to
+keep them out of ingestion.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from pipeline.schema import SourceDocument, compute_doc_id, normalize_allowed_roles
+from pipeline.schema import EXTENDED_FIELDS, SourceDocument, coerce_extended, compute_doc_id, normalize_allowed_roles
 from pipeline.type_router import RoutedFile
 
 logger = logging.getLogger(__name__)
@@ -67,17 +73,27 @@ def _as_str(value: Any) -> Optional[str]:
     return text or None
 
 
-def _normalize(raw: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Split a raw vendor dict into (known fields keyed by our names, extra)."""
+def _normalize(raw: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Split a raw vendor dict into (core fields by our names, EXTENDED_FIELDS values, extra)."""
     known: Dict[str, Any] = {}
+    extended: Dict[str, Any] = {}
     extra: Dict[str, Any] = {}
     for key, value in raw.items():
-        field = _LOOKUP.get(str(key).strip().lower())
-        if field is None:
+        lowered = str(key).strip().lower()
+        field = _LOOKUP.get(lowered)
+        if field is not None:
+            known.setdefault(field, value)  # first alias wins
+        elif lowered in EXTENDED_FIELDS:
+            extended.setdefault(lowered, value)
+        else:
             extra[str(key)] = value
-        elif field not in known:  # first alias wins
-            known[field] = value
-    return known, extra
+    return known, extended, extra
+
+
+def is_metadata_file(path: Path) -> bool:
+    """True for sidecar (*.meta.json) and batch (metadata.json, manifest.json) files."""
+    name = path.name.lower()
+    return name.endswith(".meta.json") or name in _BATCH_FILES
 
 
 def _legacy_urls(batch: Dict[str, Any]) -> Dict[str, str]:
@@ -117,6 +133,9 @@ class BatchMetadata:
             for fname, url in _legacy_urls(batch).items():
                 self._legacy_urls.setdefault(fname, url)
 
+    def lookup(self, delivered: Path) -> Dict[str, Any]:
+        return self.for_file(delivered.name)
+
     def for_file(self, filename: str) -> Dict[str, Any]:
         """Batch-level metadata for one filename: file entry over defaults over legacy url."""
         merged: Dict[str, Any] = {}
@@ -127,9 +146,38 @@ class BatchMetadata:
         return merged
 
 
+class MetadataResolver:
+    """
+    Batch metadata for an arbitrary directory tree. For a file, every directory
+    from `root` down to the file's own is consulted, the nearest overriding the
+    farther. Directory names themselves carry no meaning.
+    """
+
+    def __init__(self, root: Path):
+        self._root = root.resolve()
+        self._cache: Dict[Path, BatchMetadata] = {}
+
+    def _batch(self, directory: Path) -> BatchMetadata:
+        if directory not in self._cache:
+            self._cache[directory] = BatchMetadata(directory)
+        return self._cache[directory]
+
+    def lookup(self, delivered: Path) -> Dict[str, Any]:
+        directory = delivered.resolve().parent
+        chain = [directory, *directory.parents]
+        if self._root in chain:
+            chain = chain[: chain.index(self._root) + 1]
+        else:
+            chain = chain[:1]  # outside the root: only its own directory
+        merged: Dict[str, Any] = {}
+        for d in reversed(chain):  # root first, nearest last (wins)
+            merged.update(self._batch(d).for_file(delivered.name))
+        return merged
+
+
 def build_source_document(
     routed: RoutedFile,
-    batch: Optional[BatchMetadata] = None,
+    batch: Optional[BatchMetadata | MetadataResolver] = None,
     doc_id: Optional[str] = None,
 ) -> SourceDocument:
     """
@@ -140,10 +188,14 @@ def build_source_document(
     delivered = routed.origin  # sidecars sit next to the file as delivered (the zip, for members)
     raw: Dict[str, Any] = {}
     if batch is not None:
-        raw.update(batch.for_file(delivered.name))
+        raw.update(batch.lookup(delivered))
     raw.update(_load_json_dict(delivered.with_name(delivered.name + ".meta.json")))
 
-    known, extra = _normalize(raw)
+    known, extended, extra = _normalize(raw)
+    fields, rejected = coerce_extended(extended)
+    if rejected:
+        logger.warning(f"{routed.display_name}: could not convert {', '.join(rejected)}; stored as null")
+        extra.update({k: extended[k] for k in rejected})  # keep the original value for traceability
 
     return SourceDocument(
         path=routed.path,
@@ -156,6 +208,7 @@ def build_source_document(
         vendor=_as_str(known.get("vendor")),
         published_at=_as_str(known.get("published_at")),
         allowed_roles=normalize_allowed_roles(known.get("allowed_roles")),
+        fields={k: v for k, v in fields.items() if v is not None},
         extra={
             **extra,
             **({"vendor_doc_id": _as_str(known["vendor_doc_id"])} if _as_str(known.get("vendor_doc_id")) else {}),

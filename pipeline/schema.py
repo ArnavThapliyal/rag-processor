@@ -9,7 +9,9 @@ The Processor's data contract, defined once.
 
 Vendor metadata is inconsistent by design, so everything not needed to
 identify a row is Optional/nullable, and unknown vendor fields are kept in
-`metadata_json` rather than dropped. `allowed_roles` is a top-level nullable
+`metadata_json` rather than dropped. The downstream-LLM fields (isin, ohlc,
+fundamentals, shareholding, announcements, ...) are typed nullable columns listed in
+EXTENDED_FIELDS; a value that cannot be coerced to its type becomes null. `allowed_roles` is a top-level nullable
 column (not buried in metadata_json) because the OPA policy in
 tests/rag_authz.rego reads `document.metadata.allowed_roles`.
 """
@@ -77,8 +79,146 @@ class ChunkRecord(LanceModel):
     page_range: Optional[str] = None  # "5" or "5-7"; null for page-less formats
     allowed_roles: Optional[List[str]] = None  # null = no restriction declared
 
+    # --- fields the downstream LLM expects; all nullable, null when the vendor didn't supply them.
+    # Keep in sync with EXTENDED_FIELDS below (tests/test_schema.py enforces it).
+    # Dates/timestamps are ISO-8601 strings as supplied, like published_at.
+    # instrument / classification
+    isin: Optional[str] = None
+    nse_symbol: Optional[str] = None
+    series: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    market_cap_cr: Optional[float] = None
+    free_float_pct: Optional[float] = None
+    is_fno: Optional[bool] = None
+    # price / volume
+    trade_date: Optional[str] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    total_traded_qty: Optional[int] = None
+    turnover_cr: Optional[float] = None
+    deliverable_qty: Optional[int] = None
+    delivery_pct: Optional[float] = None
+    no_of_trades: Optional[int] = None
+    bulk_block_deal_flag: Optional[bool] = None
+    futures_oi: Optional[int] = None
+    oi_change_pct: Optional[float] = None
+    # fundamentals
+    quarter_ending: Optional[str] = None
+    sales_growth_yoy: Optional[float] = None
+    sales_growth_qoq: Optional[float] = None
+    ebitda_margin_pct: Optional[float] = None
+    pat_growth_yoy: Optional[float] = None
+    eps_ttm: Optional[float] = None
+    roce_pct: Optional[float] = None
+    roe_pct: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    interest_coverage: Optional[float] = None
+    cash_flow_from_ops: Optional[float] = None
+    # valuation
+    pe_ratio: Optional[float] = None
+    sector_median_pe: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+    peg_ratio: Optional[float] = None
+    # shareholding
+    promoter_holding_pct: Optional[float] = None
+    promoter_pledge_pct: Optional[float] = None
+    fii_holding_chg_qoq: Optional[float] = None
+    dii_holding_chg_qoq: Optional[float] = None
+    retail_holding_chg_qoq: Optional[float] = None
+    # surveillance / announcements / concalls / insider activity
+    surveillance_stage: Optional[str] = None
+    broadcast_timestamp: Optional[str] = None
+    announcement_category: Optional[str] = None
+    announcement_headline: Optional[str] = None
+    announcement_body_md: Optional[str] = None
+    concall_commentary_md: Optional[str] = None
+    concall_guidance_md: Optional[str] = None
+    sast_insider_activity: Optional[str] = None
+    bulk_block_deal_participants: Optional[str] = None
+
     # --- everything else the vendor sent, JSON-encoded ---
     metadata_json: str = "{}"
+
+
+# Column name -> python type, for the downstream-LLM fields above. Single place
+# that says how a raw vendor value is coerced before it reaches the typed column.
+EXTENDED_FIELDS: Dict[str, type] = {
+    **{name: str for name in (
+        "isin", "nse_symbol", "series", "sector", "industry", "trade_date", "quarter_ending",
+        "surveillance_stage", "broadcast_timestamp", "announcement_category", "announcement_headline",
+        "announcement_body_md", "concall_commentary_md", "concall_guidance_md", "sast_insider_activity",
+        "bulk_block_deal_participants",
+    )},
+    **{name: float for name in (
+        "market_cap_cr", "free_float_pct", "open", "high", "low", "close", "turnover_cr", "delivery_pct",
+        "oi_change_pct", "sales_growth_yoy", "sales_growth_qoq", "ebitda_margin_pct", "pat_growth_yoy",
+        "eps_ttm", "roce_pct", "roe_pct", "debt_to_equity", "interest_coverage", "cash_flow_from_ops",
+        "pe_ratio", "sector_median_pe", "ev_ebitda", "peg_ratio", "promoter_holding_pct",
+        "promoter_pledge_pct", "fii_holding_chg_qoq", "dii_holding_chg_qoq", "retail_holding_chg_qoq",
+    )},
+    **{name: int for name in ("total_traded_qty", "deliverable_qty", "no_of_trades", "futures_oi")},
+    **{name: bool for name in ("is_fno", "bulk_block_deal_flag")},
+}
+
+_TRUE = {"true", "t", "yes", "y", "1"}
+_FALSE = {"false", "f", "no", "n", "0"}
+
+
+def _coerce(value: Any, kind: type) -> Any:
+    """Coerce one raw vendor value to `kind`; raises ValueError/TypeError when it can't."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if kind is str:
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False, default=str)
+        return str(value).strip() or None
+    if kind is bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _TRUE:
+            return True
+        if text in _FALSE:
+            return False
+        raise ValueError(f"not a boolean: {value!r}")
+    if isinstance(value, bool):
+        raise ValueError(f"not a number: {value!r}")
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().replace(",", "").rstrip("%").strip()
+        if text.startswith("(") and text.endswith(")"):  # accounting negative: (12.5)
+            text = "-" + text[1:-1]
+        number = float(text)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"not a finite number: {value!r}")
+    if kind is int:
+        if not number.is_integer():
+            raise ValueError(f"not a whole number: {value!r}")
+        return int(number)
+    return number
+
+
+def coerce_extended(raw: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+    """
+    Keep only EXTENDED_FIELDS keys and coerce them to their column types.
+    A value that cannot be coerced becomes None (never an exception) and its
+    key is returned in the rejected list so callers can log it.
+    """
+    clean: Dict[str, Any] = {}
+    rejected: List[str] = []
+    for name, kind in EXTENDED_FIELDS.items():
+        if name not in raw:
+            continue
+        try:
+            clean[name] = _coerce(raw[name], kind)
+        except (ValueError, TypeError):
+            clean[name] = None
+            rejected.append(name)
+    return clean, rejected
 
 
 @dataclass
@@ -95,6 +235,7 @@ class SourceDocument:
     vendor: Optional[str] = None
     published_at: Optional[str] = None
     allowed_roles: Optional[List[str]] = None
+    fields: Dict[str, Any] = field(default_factory=dict)  # EXTENDED_FIELDS values, applied to every chunk
     extra: Dict[str, Any] = field(default_factory=dict)  # unmapped vendor fields -> metadata_json
 
 
@@ -108,6 +249,7 @@ class Chunk:
     section_path: Optional[str] = None
     page_range: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)  # e.g. sheet name, row range
+    fields: Dict[str, Any] = field(default_factory=dict)  # EXTENDED_FIELDS for this chunk; overrides the document's
 
 
 # ---- parser output (the IR consumed by the cleaner and chunker) --------------
@@ -240,6 +382,7 @@ def build_record(
         raise ValueError(f"unknown content_kind {chunk.content_kind!r}")
 
     source_type = doc.source_type if doc.source_type in SOURCE_TYPES else "unknown"
+    extended, _ = coerce_extended({**doc.fields, **chunk.fields})
 
     row = ChunkRecord(
         doc_id=doc.doc_id,
@@ -264,5 +407,6 @@ def build_record(
         page_range=chunk.page_range,
         allowed_roles=doc.allowed_roles,
         metadata_json=json.dumps({**doc.extra, **chunk.metadata}, default=str, sort_keys=True),
+        **extended,
     )
     return row.model_dump()

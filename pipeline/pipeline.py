@@ -1,42 +1,66 @@
 #!/usr/bin/env python3
 """
-Pipeline orchestration logic.
+Pipeline orchestration.
 
-PipelineRunner does exactly three things, nothing else:
-    1. Run the index stage over each input unit (a directory of purchased files).
-    2. Log every unit start/end and status.
-    3. Validate the metadata dict the stage returns, and aggregate file counts.
+    PipelineRunner().run(root)
 
-It has zero knowledge of *how* indexing works — that lives in indexer.py.
+`root` is any directory (or a single file). It is crawled recursively with
+Path.rglob and every file found is handed to the indexer. There is no required
+layout: folder names and depth are ignored, and what a file *is* comes only from
+type_router's content sniffing. The one place the tree matters is locating
+optional metadata files (see metadata.py), and those are never ingested.
 
-ACTIVE CHAIN:
-    index   parse -> clean -> chunk -> embed -> upsert, in memory, per file.
-
-    Acquisition (crawling, collectors) is out of scope: the data is purchased
-    and arrives as static files under config.settings.INPUT_DIR.
-
-INPUT UNITS [TRANSITIONAL]:
-    A unit is a named directory of files. main.py builds them from the
-    immediate subdirectories of the input dir. Until indexer.py is reworked
-    (Step 6) the unit name is still passed through as the legacy `symbol`
-    value, so name unit directories accordingly if you want `symbol` set.
+Acquisition (crawling, collectors) is out of scope: the data is purchased and
+arrives as static files.
 
 FAILURE MODEL:
-    A unit is failed only if the index stage raises or returns an invalid
-    result. Per-file failures inside a unit are isolated by the indexer and
-    reported as files_failed; main.py exits non-zero when any are present.
+    Per-file. The indexer isolates each file, so one bad file never stops the
+    rest; failures are reported in the summary (files_failed / failed_files) and
+    main.py exits non-zero when there are any.
 """
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List
 
+from config.settings import LANCEDB_PATH, LOG_DIR, SCRATCH_DIR
 from pipeline.indexer import Indexer
+from pipeline.metadata import is_metadata_file
 
 logger = logging.getLogger(__name__)
 
-VALID_STATUSES = ("success", "skipped", "no_data")
 _COUNTER_KEYS = ("files_indexed", "files_failed", "files_skipped", "chunks_written")
+# Our own working directories are never input, even when the root is the data dir.
+_WORK_DIRS = (SCRATCH_DIR, LOG_DIR, LANCEDB_PATH)
+
+
+def discover_files(root: Path) -> List[Path]:
+    """
+    Every candidate file under `root`, sorted for a deterministic run order.
+
+    Skipped: hidden files and anything inside a hidden directory (.DS_Store,
+    ._x, .git), symlinks (avoids double-ingesting the same bytes), sidecar/batch
+    metadata files, and the pipeline's own working directories.
+    """
+    root = Path(root)
+    if root.is_file():
+        return [root]
+
+    work = [d.resolve() for d in _WORK_DIRS]
+    files: List[Path] = []
+    for path in root.rglob("*"):
+        rel_parts = path.relative_to(root).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        if is_metadata_file(path):
+            continue
+        resolved = path.resolve()
+        if any(d == resolved or d in resolved.parents for d in work):
+            continue
+        files.append(path)
+    return sorted(files)
 
 
 class PipelineRunner:
@@ -44,40 +68,28 @@ class PipelineRunner:
     def __init__(self) -> None:
         self._indexer = Indexer()
 
-    def run(self, units: Mapping[str, Path]) -> Dict[str, Any]:
-        logger.info(f"Starting pipeline for {len(units)} input unit(s)")
+    def run(self, root: Path) -> Dict[str, Any]:
+        root = Path(root)
+        files = discover_files(root)
+        logger.info(f"Starting pipeline: {len(files)} file(s) under {root}")
 
-        succeeded: List[str] = []
-        failed: List[str] = []
-        totals = {key: 0 for key in _COUNTER_KEYS}
+        base = root if root.is_dir() else root.parent
+        result = self._validate_result(self._indexer.index_files(files, base))
 
-        for name, path in units.items():
-            logger.info(f"[index] [{name}] starting ({path})")
-            try:
-                raw_result = self._indexer.index_symbol(name, raw_dir=path)
-                metadata = self._validate_result(name, raw_result)
-                logger.info(f"[index] [{name}] completed: {metadata}")
-            except Exception as exc:
-                logger.error(f"[index] [{name}] failed: {exc}", exc_info=True)
-                failed.append(name)
-                continue
-
-            succeeded.append(name)
-            for key in _COUNTER_KEYS:
-                totals[key] += int(metadata.get(key, 0) or 0)
-
-        logger.info(
-            f"Pipeline run complete: {len(succeeded)} succeeded, "
-            f"{len(failed)} failed, out of {len(units)} — {totals}"
-        )
-        return {"total": len(units), "succeeded": succeeded, "failed": failed, **totals}
+        summary = {
+            "root": str(root),
+            "files_found": len(files),
+            **{key: int(result.get(key, 0) or 0) for key in _COUNTER_KEYS},
+            "failed_files": list(result.get("failed_files", [])),
+        }
+        logger.info(f"Pipeline run complete: {summary}")
+        return summary
 
     @staticmethod
-    def _validate_result(name: str, raw: Any) -> Dict[str, Any]:
-        """A stage that returns nothing, or a malformed result, is a failure — not a silent success."""
+    def _validate_result(raw: Any) -> Dict[str, Any]:
+        """A malformed indexer result is an error, not a silent success."""
         if not isinstance(raw, dict):
-            raise ValueError(f"[{name}] index stage returned {type(raw).__name__}, expected dict")
-        status = raw.get("status")
-        if status not in VALID_STATUSES:
-            raise ValueError(f"[{name}] index stage returned invalid status {status!r}")
+            raise ValueError(f"indexer returned {type(raw).__name__}, expected dict")
+        if raw.get("status") not in ("success", "skipped", "no_data"):
+            raise ValueError(f"indexer returned invalid status {raw.get('status')!r}")
         return raw
