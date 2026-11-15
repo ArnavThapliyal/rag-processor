@@ -9,7 +9,7 @@ uv sync                 # Python 3.11, dependencies from uv.lock
 
 Runtime dependencies: `docling`, `lancedb`, `sentence-transformers`, `torch`, `tokenizers`, `numpy`, `pandas`, `pyarrow`, `openpyxl`, `xlrd`, `python-magic`. Dev: `pytest`, `ruff`, `reportlab` (builds PDF fixtures).
 
-No scraping libraries are declared. `beautifulsoup4`, `httpx` and `tenacity` still appear in `uv.lock` because docling and huggingface-hub depend on them.
+No scraping libraries are declared. `beautifulsoup4` and `httpx` still appear in `uv.lock` because docling and huggingface-hub depend on them.
 
 ## Repository layout
 
