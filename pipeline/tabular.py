@@ -7,6 +7,10 @@ markdown table. The row range, sheet name and column names travel in
 chunk.metadata, which makes it straightforward to route these tables to a
 relational store later without re-parsing.
 
+Record mode: a table whose header names several of the downstream-LLM columns
+(trade_date, close, roe_pct, ...) is emitted one chunk per row instead, with
+those values coerced into Chunk.fields so the typed LanceDB columns are filled.
+
 Files are streamed in row groups, so memory stays bounded for large inputs.
 `table_chunks` is shared with the document path, which uses it for tables that
 docling extracts out of PDFs/Office files.
@@ -22,15 +26,21 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
-from config.settings import CHUNK_SIZE_TOKENS, TABULAR_MAX_ROWS_PER_FILE, TABULAR_ROWS_PER_CHUNK
-from pipeline.schema import CONTENT_KIND_TABLE, Chunk, TableData
+from config.settings import (
+    CHUNK_SIZE_TOKENS, TABULAR_MAX_ROWS_PER_FILE, TABULAR_RECORD_MIN_MATCHES, TABULAR_RECORD_MODE,
+    TABULAR_ROWS_PER_CHUNK,
+)
+from pipeline.schema import CONTENT_KIND_TABLE, EXTENDED_FIELDS, Chunk, TableData, coerce_extended
 
 logger = logging.getLogger(__name__)
 
 # Numbers tokenise at roughly 3 characters/token, so this is the default size
 # budget when no tokenizer-based size function is supplied (Step 4 supplies one).
 _CHARS_PER_TOKEN = 3
-_HEADER_SNIFF_ROWS = 1000
+_SYMBOL_COLUMNS = ("symbol", "ticker", "scrip", "scrip_code")  # same spellings metadata.py accepts
+_MAX_CSV_FIELD_BYTES = 16 * 1024 * 1024
+
+csv.field_size_limit(_MAX_CSV_FIELD_BYTES)
 
 SizeFn = Callable[[str], int]
 
@@ -102,6 +112,46 @@ def _group_rows(
         yield flush()
 
 
+# ---- record mode ----------------------------------------------------------------
+
+def _record_columns(header: Sequence[str]) -> Dict[int, str]:
+    """column position -> downstream-LLM field, for header names that are exactly such a field."""
+    columns: Dict[int, str] = {}
+    for position, name in enumerate(header):
+        field = name.strip().lower()
+        if field in EXTENDED_FIELDS and field not in columns.values():
+            columns[position] = field
+    return columns
+
+
+def _record_rows(
+    header: List[str],
+    rows: Iterator[Sequence[str]],
+    columns: Dict[int, str],
+    *,
+    start_index: int,
+    section_path: Optional[str],
+    metadata: Dict[str, Any],
+) -> Iterator[Chunk]:
+    """One chunk per row: 'column: value' lines as text, typed values in Chunk.fields."""
+    symbol_at = next((i for i, name in enumerate(header) if name.strip().lower() in _SYMBOL_COLUMNS), None)
+    index = start_index
+    for row_number, row in enumerate(rows, start=1):
+        row = list(row)
+        text = "\n".join(f"{name}: {value}" for name, value in zip(header, row) if value != "")
+        if not text:
+            continue
+        fields, rejected = coerce_extended({field: row[i] for i, field in columns.items() if i < len(row)})
+        meta = {**metadata, "row_start": row_number, "row_end": row_number, "record": True}
+        if rejected:
+            meta["unconverted"] = {name: row[i] for i, name in columns.items() if name in rejected}
+        symbol = row[symbol_at].strip() if symbol_at is not None and symbol_at < len(row) else ""
+        yield Chunk(index=index, text=text, content_kind=CONTENT_KIND_TABLE, section_path=section_path,
+                    metadata=meta, fields={k: v for k, v in fields.items() if v is not None},
+                    symbol=symbol or None)
+        index += 1
+
+
 # ---- cell / header normalisation ---------------------------------------------
 
 def _cell(value: Any) -> str:
@@ -139,7 +189,23 @@ def _is_blank(row: Sequence[Any]) -> bool:
 
 # ---- readers -----------------------------------------------------------------
 
-def _read_csv(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
+def _tolerant(reader: Iterator[List[str]], path: Path, warnings: Optional[List[str]]) -> Iterator[List[str]]:
+    """Iterate a csv reader, skipping rows it cannot parse instead of failing the file."""
+    bad = 0
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            break
+        except csv.Error:
+            bad += 1
+            continue
+        yield row
+    if bad:
+        _warn(warnings, f"{path.name}: skipped {bad} unparseable row(s)")
+
+
+def _read_csv(path: Path, warnings: Optional[List[str]] = None) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
     for encoding in ("utf-8-sig", "cp1252"):
         try:
             with open(path, newline="", encoding=encoding) as f:
@@ -157,7 +223,7 @@ def _read_csv(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[L
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
         except csv.Error:
             dialect = csv.excel
-        reader = csv.reader(f, dialect)
+        reader = _tolerant(csv.reader(f, dialect), path, warnings)
         header = None
         for row in reader:
             if not _is_blank(row):
@@ -168,7 +234,7 @@ def _read_csv(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[L
         yield None, header, (_pad(r, len(header)) for r in reader if not _is_blank(r))
 
 
-def _read_xlsx(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
+def _read_xlsx(path: Path, warnings: Optional[List[str]] = None) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
     from openpyxl import load_workbook
 
     wb = load_workbook(path, read_only=True, data_only=True)
@@ -187,7 +253,7 @@ def _read_xlsx(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[
         wb.close()
 
 
-def _read_xls(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
+def _read_xls(path: Path, warnings: Optional[List[str]] = None) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
     import pandas as pd
 
     for sheet, df in pd.read_excel(path, sheet_name=None, header=None, dtype=object, engine="xlrd").items():
@@ -210,7 +276,7 @@ def _flatten(obj: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
     return flat
 
 
-def _json_records(path: Path) -> Optional[List[Dict[str, Any]]]:
+def _json_records(path: Path, warnings: Optional[List[str]] = None) -> Optional[List[Dict[str, Any]]]:
     """Rows from jsonl, a top-level list of objects, or one list-of-objects value inside an object."""
     text = path.read_text(encoding="utf-8-sig")
     try:
@@ -218,10 +284,19 @@ def _json_records(path: Path) -> Optional[List[Dict[str, Any]]]:
     except json.JSONDecodeError:
         # newline-delimited JSON
         records = []
+        bad = 0
         for line in text.splitlines():
             line = line.strip()
-            if line:
-                records.append(json.loads(line))  # a malformed line raises -> file fails loudly
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad += 1
+        if not records:
+            return None  # not JSON at all: the caller reports the file as unusable
+        if bad:
+            _warn(warnings, f"{path.name}: skipped {bad} malformed JSON line(s)")
         data = records
 
     if isinstance(data, dict):
@@ -235,8 +310,8 @@ def _json_records(path: Path) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
-def _read_json(path: Path) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
-    records = _json_records(path)
+def _read_json(path: Path, warnings: Optional[List[str]] = None) -> Iterator[tuple[Optional[str], List[str], Iterator[List[str]]]]:
+    records = _json_records(path, warnings)
     if records is None:
         raise ValueError("JSON is not a list of objects (or an object containing one); no tabular shape")
     keys: Dict[str, None] = {}
@@ -266,13 +341,18 @@ def read_table_chunks(
     rows_per_chunk: int = TABULAR_ROWS_PER_CHUNK,
     max_rows: int = TABULAR_MAX_ROWS_PER_FILE,
     warnings: Optional[List[str]] = None,
+    record_mode: str = TABULAR_RECORD_MODE,
 ) -> Iterator[Chunk]:
     """
     Stream a tabular file as table chunks, numbered consecutively across sheets.
 
     Raises ValueError for an unsupported type or an unusable shape (the indexer
     isolates that as a per-file failure). Rows beyond `max_rows` are dropped
-    with an entry in `warnings`.
+    with an entry in `warnings`, as are individual rows that cannot be parsed.
+
+    Each sheet is one table; chunk.metadata carries table_ordinal, sheet,
+    row_start/row_end and (for row groups) columns, so the same rows can be
+    located again when tables are moved to a relational store.
     """
     reader = _READERS.get(source_type)
     if reader is None:
@@ -280,17 +360,23 @@ def read_table_chunks(
 
     index = 0
     rows_seen = 0
-    for sheet, header, rows in reader(path):
+    for ordinal, (sheet, header, rows) in enumerate(reader(path, warnings)):
         remaining = max_rows - rows_seen
         if remaining <= 0:
             _warn(warnings, f"{path.name}: row limit {max_rows} reached; remaining sheets/rows skipped")
             return
 
         counted = _Counter(itertools.islice(rows, remaining))
-        meta: Dict[str, Any] = {"sheet": sheet} if sheet else {}
-        for chunk in _group_rows(header, iter(counted), start_index=index, rows_per_chunk=rows_per_chunk,
-                                 max_size=max_size, size_fn=size_fn, section_path=sheet, page_range=None,
-                                 metadata=meta):
+        meta: Dict[str, Any] = {"table_ordinal": ordinal, **({"sheet": sheet} if sheet else {})}
+        columns = _record_columns(header) if record_mode == "auto" else {}
+        if len(columns) >= TABULAR_RECORD_MIN_MATCHES:
+            produced = _record_rows(header, iter(counted), columns, start_index=index, section_path=sheet,
+                                    metadata=meta)
+        else:
+            produced = _group_rows(header, iter(counted), start_index=index, rows_per_chunk=rows_per_chunk,
+                                   max_size=max_size, size_fn=size_fn, section_path=sheet, page_range=None,
+                                   metadata=meta)
+        for chunk in produced:
             index = chunk.index + 1
             yield chunk
         rows_seen += counted.count

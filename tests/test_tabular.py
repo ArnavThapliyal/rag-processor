@@ -100,3 +100,70 @@ def test_table_chunks_for_in_memory_tables_carry_provenance():
     chunks = table_chunks(t, start_index=7, rows_per_chunk=2, section_path="Sec", page_range="3")
     assert [c.index for c in chunks] == [7, 8, 9]
     assert all(c.section_path == "Sec" and c.page_range == "3" for c in chunks)
+
+
+# ---- record mode, table identity, bad rows ------------------------------------
+
+PRICES = "SYMBOL,trade_date,Open,HIGH,low,close,total_traded_qty,is_fno,note\n" \
+         "TCS,2025-11-07,\"4,100.5\",4150,4090,4120.25,1500000,Y,ok\n" \
+         "INFY,2025-11-07,1500,1510,n/a,1505,,N,\n"
+
+
+def test_price_file_becomes_one_chunk_per_row_with_typed_fields(tmp_path):
+    p = tmp_path / "bhav.csv"
+    p.write_text(PRICES)
+    chunks = list(read_table_chunks(p, "csv"))
+    assert len(chunks) == 2 and all(c.content_kind == "table" for c in chunks)
+    tcs, infy = chunks
+    assert tcs.symbol == "TCS" and infy.symbol == "INFY"
+    assert tcs.fields == {"trade_date": "2025-11-07", "open": 4100.5, "high": 4150.0, "low": 4090.0,
+                          "close": 4120.25, "total_traded_qty": 1500000, "is_fno": True}
+    assert tcs.text.splitlines()[:3] == ["SYMBOL: TCS", "trade_date: 2025-11-07", "Open: 4,100.5"]
+    assert "low" not in infy.fields and infy.metadata["unconverted"] == {"low": "n/a"}  # null column, value kept
+    assert "note" not in infy.text and "total_traded_qty" not in infy.text              # empty cells are omitted
+    assert (tcs.metadata["row_start"], tcs.metadata["row_end"], infy.metadata["row_start"]) == (1, 1, 2)
+    assert tcs.metadata["table_ordinal"] == 0 and tcs.metadata["record"] is True
+
+
+def test_record_mode_off_or_too_few_matching_columns_keeps_row_groups(tmp_path):
+    p = tmp_path / "bhav.csv"
+    p.write_text(PRICES)
+    grouped = list(read_table_chunks(p, "csv", record_mode="off"))
+    assert len(grouped) == 1 and grouped[0].fields == {} and grouped[0].text.startswith("| SYMBOL |")
+
+    q = tmp_path / "misc.csv"
+    q.write_text("name,close,comment\nA,1,x\nB,2,y\n")   # only one matching column
+    assert len(list(read_table_chunks(q, "csv"))) == 1
+
+
+def test_each_sheet_is_its_own_table_with_a_stable_ordinal(tmp_path):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Q1"
+    ws.append(["name", "revenue"])
+    ws.append(["A", 1])
+    ws2 = wb.create_sheet("Q2")
+    ws2.append(["name", "revenue"])
+    ws2.append(["B", 2])
+    p = tmp_path / "a.xlsx"
+    wb.save(p)
+    first = [(c.metadata["table_ordinal"], c.metadata["sheet"]) for c in read_table_chunks(p, "xlsx")]
+    again = [(c.metadata["table_ordinal"], c.metadata["sheet"]) for c in read_table_chunks(p, "xlsx")]
+    assert first == again == [(0, "Q1"), (1, "Q2")]
+
+
+def test_unparseable_rows_are_skipped_and_counted_not_fatal(tmp_path):
+    p = tmp_path / "bad.jsonl"
+    p.write_text('{"a": 1}\n{broken\n{"a": 2}\n')
+    warnings = []
+    chunks = list(read_table_chunks(p, "json", warnings=warnings))
+    assert "| 1 |" in chunks[0].text and "| 2 |" in chunks[0].text
+    assert any("skipped 1 malformed JSON line" in w for w in warnings)
+
+    import pytest
+    garbage = tmp_path / "garbage.json"
+    garbage.write_text("this is not json\nat all\n")
+    with pytest.raises(ValueError):
+        list(read_table_chunks(garbage, "json"))

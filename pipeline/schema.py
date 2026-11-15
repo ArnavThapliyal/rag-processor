@@ -250,6 +250,7 @@ class Chunk:
     page_range: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)  # e.g. sheet name, row range
     fields: Dict[str, Any] = field(default_factory=dict)  # EXTENDED_FIELDS for this chunk; overrides the document's
+    symbol: Optional[str] = None  # set when one file holds rows for many instruments; overrides the document's
 
 
 # ---- parser output (the IR consumed by the cleaner and chunker) --------------
@@ -398,7 +399,7 @@ def build_record(
         embedding_model=embedding_model,
         pipeline_version=pipeline_version,
         ingest_run_id=ingest_run_id,
-        symbol=doc.symbol,
+        symbol=chunk.symbol or doc.symbol,
         source_url=doc.source_url,
         doc_type=doc.doc_type,
         vendor=doc.vendor,
