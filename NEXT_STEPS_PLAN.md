@@ -63,7 +63,7 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
 
 ### Needs you or the LLM side
 
-- [ ] **`allowed_roles` semantics.** Confirm how `tests/rag_authz.rego` treats a document whose `allowed_roles` is null. If null must mean "deny", add a `DEFAULT_ALLOWED_ROLES` setting applied in `metadata.py`.
+- [ ] `allowed_roles` **semantics.** Confirm how `tests/rag_authz.rego` treats a document whose `allowed_roles` is null. If null must mean "deny", add a `DEFAULT_ALLOWED_ROLES` setting applied in `metadata.py`.
 - [ ] **Column types.** Confirm the types of the 50 columns, especially dates as strings, before the first production load. Changing them later means reloading.
 - [ ] **Table name.** The table is `documents` (was `company_documents`). The LLM side must read the new name and search with `metric("cosine")`.
 - [ ] **Record mode.** Confirm decision 1 above against the size of the real price and fundamentals files.

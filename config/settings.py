@@ -56,6 +56,9 @@ EMBED_QUEUE_MAX_BATCHES = _env("EMBED_QUEUE_MAX_BATCHES", 8, int)  # backpressur
 # the headroom is for a single table row too wide to split.
 EMBED_MAX_SEQ_LENGTH = _env("EMBED_MAX_SEQ_LENGTH", 1024, int)
 MPS_EMPTY_CACHE_EVERY = _env("MPS_EMPTY_CACHE_EVERY", 50, int)  # encode calls between torch.mps.empty_cache()
+# On MPS every batch shape in use holds device memory permanently (see embedder.py), and the
+# largest shape dominates: 64 rows x 1024 tokens kept ~28 GB resident, 32 rows about half that.
+MPS_MAX_BATCH_SIZE = _env("MPS_MAX_BATCH_SIZE", 32, int)
 
 # ---- chunking ---------------------------------------------------------------
 

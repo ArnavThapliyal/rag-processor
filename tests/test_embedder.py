@@ -7,7 +7,7 @@ import pytest
 
 import pipeline.embedder as emb
 from pipeline.embedder import Embedder, resolve_device
-from stub_embedder import StubModel, text_vector
+from stub_embedder import StubModel, TensorStubModel, text_vector
 
 
 def test_rows_come_back_in_input_order_despite_length_sorting():
@@ -58,6 +58,42 @@ def test_bad_model_output_is_rejected():
         Embedder(model=WrongDim()).encode(["a"])
     with pytest.raises(ValueError, match="non-finite"):
         Embedder(model=NaNs()).encode(["a"])
+
+
+def test_fixed_shape_mode_uses_few_shapes_and_returns_the_same_vectors():
+    import random
+
+    random.seed(1)
+    model = TensorStubModel()
+    e = Embedder(model=model, batch_size=32, fixed_shapes=True)
+    for call in range(40):                               # many calls with very different sizes and lengths
+        texts = [" ".join(["w"] * random.randint(1, 900)) + f" call{call} row{i}" for i in range(random.randint(1, 70))]
+        out = e.encode(texts)
+        assert out.shape == (len(texts), 1024)
+        assert np.allclose(out[0], text_vector(texts[0]), atol=1e-5)
+        assert np.allclose(out[-1], text_vector(texts[-1]), atol=1e-5)
+        assert np.allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-5)
+    rows = {shape[0] for shape in model.forward_shapes}
+    tokens = {shape[1] for shape in model.forward_shapes}
+    assert rows <= {4, 16, 32} and tokens <= {64, 128, 256, 512, 1024}
+    assert e.shapes_used == set(model.forward_shapes) and len(e.shapes_used) <= 15
+
+
+def test_persistent_out_of_memory_falls_back_to_cpu_when_the_model_can_move():
+    class Movable(StubModel):
+        def __init__(self):
+            super().__init__(oom_above=0)
+            self.moved_to = None
+
+        def to(self, device):
+            self.moved_to = device
+            self.oom_above = None                        # the cpu has room
+
+    model = Movable()
+    e = Embedder(model=model, device="mps", batch_size=4)
+    out = e.encode(["a", "b", "c"])
+    assert model.moved_to == "cpu" and e.device == "cpu"
+    assert np.allclose(out[1], text_vector("b"), atol=1e-6)
 
 
 def test_empty_input():

@@ -122,6 +122,8 @@ With `content_kind="table"` and these keys, a later job can select all table chu
 - Vectors are L2-normalised, so cosine distance equals one minus the dot product.
 - Texts are sorted by length and encoded in batches of `EMBED_BATCH_SIZE`; results come back in the input order.
 - On an out-of-memory error the batch size is halved and the batch retried; the smaller size is kept for the rest of the run.
+- **Fixed shapes on MPS.** Apple's MPS backend keeps memory for every distinct batch shape (rows × tokens) and never releases it; with naturally varying batches its memory grew to about 60 GB within a few dozen calls. On MPS every batch is therefore padded to one of at most 15 shapes (4, 16 or `MPS_MAX_BATCH_SIZE` rows; 64 to 1024 tokens in powers of two), which keeps memory flat. Padding does not change the vectors.
+- If the device is out of memory even for a single text, the embedder moves to CPU and carries on, slowly, so the run still completes.
 - Inputs longer than `EMBED_MAX_SEQ_LENGTH` tokens are truncated by the model. Prose chunks are always shorter; only a single very wide table row can reach it.
 - Half precision is used only with `EMBED_FP16=true` on CUDA.
 - Importing the module loads neither torch nor the model. There is no deduplication in the embedder.

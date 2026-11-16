@@ -31,6 +31,7 @@ All configuration is in `config/settings.py`. Each setting below can be overridd
 | `EMBED_QUEUE_MAX_BATCHES` | `8` | Capacity of the worker → embedder and embedder → main queues (backpressure) |
 | `EMBED_MAX_SEQ_LENGTH` | `1024` | Longest input, in tokens, the model encodes; longer text is truncated |
 | `MPS_EMPTY_CACHE_EVERY` | `50` | Encode calls between MPS cache releases |
+| `MPS_MAX_BATCH_SIZE` | `32` | Upper limit on the batch size when the device is MPS; larger batches hold much more device memory |
 
 ## Chunking
 

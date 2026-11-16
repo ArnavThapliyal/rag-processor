@@ -57,3 +57,34 @@ class FlakyEmbedder:
         if self.seen > self.fail_after:
             raise RuntimeError("device lost")
         return np.stack([text_vector(t) for t in texts])
+
+
+class TensorStubModel:
+    """Mimics the tokenise + forward interface of SentenceTransformer, with real torch tensors on cpu."""
+
+    max_seq_length = 1024
+
+    def __init__(self):
+        self.texts = []
+        self.forward_shapes = []
+        self.device = "cpu"
+
+    def tokenize(self, batch):
+        import torch
+
+        lengths = [max(1, len(t.split())) for t in batch]
+        width = min(self.max_seq_length, max(lengths))
+        ids = torch.zeros((len(batch), width), dtype=torch.long)
+        mask = torch.zeros((len(batch), width), dtype=torch.long)
+        for row, (text, n) in enumerate(zip(batch, lengths)):
+            self.texts.append(text)
+            ids[row, 0] = len(self.texts)          # first token identifies the text
+            mask[row, :min(n, width)] = 1
+        return {"input_ids": ids, "attention_mask": mask}
+
+    def forward(self, features):
+        import torch
+
+        self.forward_shapes.append(tuple(features["input_ids"].shape))
+        rows = [text_vector(self.texts[int(i) - 1]) * 2.0 for i in features["input_ids"][:, 0]]  # not normalised
+        return {"sentence_embedding": torch.tensor(np.stack(rows))}
