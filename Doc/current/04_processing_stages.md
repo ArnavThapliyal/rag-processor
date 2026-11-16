@@ -39,6 +39,12 @@ A zip archive produces one status per member.
 - An embedding error is retried per file, so one bad text fails one file, not the whole batch.
 - If the embedding process cannot start or dies, the run stops with an error. Nothing half-written is left behind (see the vector store below).
 
+### Known limits
+
+- A zip archive is a single task: its members are processed one after another by the worker that picked it up. A large archive of scanned PDFs occupies one worker for a long time.
+- If the main process is killed (not interrupted with Ctrl-C), workers that are in the middle of a long parse keep running until that parse returns. Check for leftover `multiprocessing.spawn` processes after a hard kill.
+- Identical files that reach two workers at the same moment are both parsed; only one is stored.
+
 ## Worker steps (`pipeline/worker.py`)
 
 `process_path(path, ctx)` yields chunk batches followed by exactly one result per routed item. It never raises for a bad file or missing metadata. Each worker keeps its own metadata cache and tokenizer, and creates the docling parser only when it meets its first document, so a worker that handles only tabular files never loads docling.

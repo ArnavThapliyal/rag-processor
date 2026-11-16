@@ -18,7 +18,25 @@ Reduce this repo to the **Processor** only: purchased mixed-format files (PDF, P
 | 6. Multiprocess `indexer.py` + `worker.py`; tabular and metadata wired in | Done |
 | 7. Tests, CI workflow, docs, repo cleanup | Done |
 
-**What remains** is validation on real purchased data and a few decisions for the LLM side. See `NEXT_STEPS_PLAN.md`, section 4.
+**What remains** is finishing the test-data run, validation on real purchased data, a few engineering follow-ups from the first run, and some decisions for the LLM side. See `NEXT_STEPS_PLAN.md`, sections 4 and 5.
+
+## Current state (2026-11-16)
+
+A first larger run was done on scraped test data and stopped part-way.
+
+| Item | Where / what |
+|---|---|
+| Test data | `/Users/arnav/Projects/Software/test symbol data/`: 13 company folders, 354 files, 1.3 GB. `DATA_INDEX.md` there lists every file |
+| How it was collected | Scripts in `/Users/arnav/Projects/Software/data_harvester/claude sample scrape script/` (`harvest_sample.py`, `market_files.py`, `variety_files.py`, `other_formats.py`, `build_index.py`), committed in that repo, not pushed |
+| Per-company metadata | A `metadata.json` in each company folder sets `symbol`, `nse_symbol`, `isin`, `sector`, `industry`, `vendor` |
+| Database | `test symbol data/lancedb`, table `documents`: 164 documents, 4,015 chunks |
+| Coverage | 360ONE: 150 documents. POLYCAB: 14 of 20 items (6 PDFs unfinished). The other 11 companies: not started |
+| Logs | `data/logs/test_symbol_data_ingest_2026-11-16_12-56-13.log` (all three runs combined) |
+| Viewer | `view_db.py` (added by the user) inspects a database and runs test searches |
+
+Bug found and fixed in that run: MPS device memory grew without bound until every embedding call failed. The embedder now pads batches to a small set of fixed shapes on MPS (commit `73dcac0`).
+
+Still open from that run: scanned PDFs are very slow, a zip archive ties up one worker, and killing the main process can leave worker processes behind (check with `pgrep -fl multiprocessing.spawn`).
 
 ## Where to read
 - `README.md`: what it does, how to run it.
@@ -54,10 +72,20 @@ Reduce this repo to the **Processor** only: purchased mixed-format files (PDF, P
 - Numeric accuracy: embeddings are poor at exact numbers; keep tables isolated for a future structured store.
 - RapidOCR covers English and Chinese only (no Hindi).
 - Record mode on very large price files produces one vector per row.
-- Each PDF worker holds docling's models in memory; tune `NUM_WORKERS` on the M4 Pro.
+- Each PDF worker holds docling's models in memory (1 to 5 GB each measured with 6 workers).
+- On MPS, never feed the model freely varying batch shapes: device memory grows and is not released. The embedder's fixed-shape mode exists for this; keep it.
+- Scanned PDFs dominate run time; decide the OCR policy before a large load.
+- After a hard kill of `main.py`, look for leftover worker processes.
 
 ## How to resume
 1. `cd /Users/arnav/Projects/Software/rag-processor && git checkout refactor/processor-only && git status`
 2. `uv sync` if `.venv` is missing; `.venv/bin/python -m pytest -q` should pass (a few tests are skipped without `RUN_SLOW=1`).
-3. Try a real delivery: `uv run python main.py <folder> --dry-run`, then without `--dry-run`.
-4. Tell Claude: "Read HANDOFF.md and NEXT_STEPS_PLAN.md, then help me validate on real data."
+3. To resume the test-data run (finished documents are skipped):
+   ```bash
+   O="/Users/arnav/Projects/Software/test symbol data"
+   LANCEDB_PATH="$O/lancedb" WORKER_STALL_TIMEOUT_SECONDS=3600 caffeinate -i uv run python main.py "$O" --workers 6
+   ```
+   Pass `"$O/<SYMBOL>"` to do one company. Add `ENABLE_ML_OCR=false` for a much faster pass that skips scanned pages.
+4. Look at the result: `uv run python view_db.py "$O"`.
+5. For a real delivery: `uv run python main.py <folder> --dry-run`, then without `--dry-run`.
+6. Tell Claude: "Read HANDOFF.md and NEXT_STEPS_PLAN.md, then continue with the follow-ups from the test run."

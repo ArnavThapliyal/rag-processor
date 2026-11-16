@@ -15,6 +15,7 @@ No scraping libraries are declared. `beautifulsoup4` and `httpx` still appear in
 
 ```
 main.py                     CLI entry point
+view_db.py                  inspect a LanceDB table and run test searches
 config/settings.py          configuration
 config/logsetup.py          logging for all processes
 pipeline/

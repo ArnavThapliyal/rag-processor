@@ -102,11 +102,22 @@ The code is the same on every machine; only environment variables differ.
 
 | Machine | Suggested overrides |
 |---|---|
-| Apple Silicon (M4 Pro) | None. Device resolves to `mps`. Each PDF worker holds docling's models in memory, so lower `NUM_WORKERS` if memory is tight |
+| Apple Silicon (M4 Pro, 48 GB) | None. Device resolves to `mps`. Measured with 6 workers: 1 to 5 GB per worker, about 13 GB of device memory for the embedder at `MPS_MAX_BATCH_SIZE=32`. Lower `NUM_WORKERS` if memory is tight |
 | CUDA server | None for the device. Consider a larger `EMBED_BATCH_SIZE`, and `EMBED_FP16=true` after a quality check |
 | CPU only | Lower `EMBED_BATCH_SIZE`; expect slow embedding |
 
 Child processes are started with `spawn` and read their settings from the environment again, so always configure through environment variables, not by editing values at runtime.
+
+## Speed against quality
+
+Scanned PDFs dominate run time. These settings trade quality for speed:
+
+| Setting | Effect |
+|---|---|
+| `ENABLE_ML_OCR=false` | No OCR pass. Scanned pages yield little or no text; text PDFs are unaffected |
+| `MAX_PAGES_FOR_OCR=<n>` | Documents with more low-text pages than this are not OCRed |
+| `TABLE_STRUCTURE_MODE=fast` | Faster table recognition, somewhat less accurate |
+| `WORKER_STALL_TIMEOUT_SECONDS=3600` | Give very large scanned documents more time before the worker is killed |
 
 ## System dependency
 

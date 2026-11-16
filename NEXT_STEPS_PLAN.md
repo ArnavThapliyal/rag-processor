@@ -1,6 +1,6 @@
 # NEXT_STEPS_PLAN.md
 
-Updated 2026-11-16, branch `refactor/processor-only`. Steps 4 to 7 of the refactor are implemented. This file records what was built, the choices made on the open decisions, and what is left before a production load.
+Updated 2026-11-16 (after the first run on scraped test data), branch `refactor/processor-only`. Steps 4 to 7 of the refactor are implemented. This file records what was built, the choices made on the open decisions, what the first larger run showed, and what is left before a production load.
 
 ## 1. Where things stand
 
@@ -15,6 +15,9 @@ Updated 2026-11-16, branch `refactor/processor-only`. Steps 4 to 7 of the refact
 | 6 | Tabular | Tabular: per-record chunks for price/fundamentals files, table ordinals, tolerant rows |
 | 6 | Indexer | Multiprocess indexer: CPU parse/chunk workers and a single embedding process |
 | 7 | Cleanup, CI | Remove orphaned modules and unused dependencies; add CI workflow |
+| fix | Cleaner | Cleaner: only remove bare numbers that are provably page numbers |
+| fix | Embedder | Embedder: stop transformers' background safetensors conversion; fix shutdown race |
+| fix | Embedder | Embedder: fixed batch shapes on MPS to stop unbounded device memory growth |
 
 Each row is one commit, so any step can be reverted on its own with `git revert <hash>` (find hashes with `git log --oneline`).
 
@@ -52,14 +55,33 @@ Each row is one commit, so any step can be reverted on its own with `git revert 
 |---|---|---|---|
 | 1 | Per-record chunks for price/fundamentals files | **On** (`auto`): a sheet whose header names at least 3 financial columns becomes one chunk per row | `TABULAR_RECORD_MODE=off`, or raise `TABULAR_RECORD_MIN_MATCHES` |
 | 2 | Types of the 50 columns | Unchanged: floats, four ints, two bools, dates as ISO strings | Edit `ChunkRecord` and `EXTENDED_FIELDS`, bump `SCHEMA_VERSION`, load into a new table |
-| 3 | Null `allowed_roles` | Stored as null ("no restriction declared"); no default is applied | Needs a decision from the LLM side, see section 4 |
+| 3 | Null `allowed_roles` | Stored as null ("no restriction declared"); no default is applied | Needs a decision from the LLM side, see section 5 |
 | 4 | Regex `doc_type` classifier | Deleted. `doc_type` comes from vendor metadata or is null | Restore from git history if a fallback is wanted |
 | 5 | `.txt` / `.md` input | Not supported; reported as `skipped_unsupported` | Add the types to `type_router.py` and a plain-text path in `worker.py` |
 | 6 | Complete documents after a hard kill | One atomic write per document; documents above `WRITE_MAX_ROWS_PER_ADD` rows use a ledger that the next run cleans up | `WRITE_MAX_ROWS_PER_ADD` |
 
 Decision 1 has a cost: record mode stores one vector per row. A price file with a million rows becomes a million rows in LanceDB and a correspondingly long embedding run. If these files are large, consider whether they belong in the vector store at all, or only in the later relational store.
 
-## 4. What is left
+## 4. First run on scraped test data (2026-11-16)
+
+Input: `/Users/arnav/Projects/Software/test symbol data`, 13 company folders, 354 files (501 items once zip archives are unpacked: 330 PDF, 49 JSON, 39 CSV, 33 HTML, 19 XLSX, 18 DOCX, 13 PPTX, 44 unsupported). The files were scraped with data_harvester and Yahoo Finance for testing; they are not the purchased data. Database: `test symbol data/lancedb`. Combined log: `data/logs/test_symbol_data_ingest_2026-11-16_12-56-13.log`.
+
+The run was **stopped before finishing**. State of the database: 164 documents, 4,015 chunks (360ONE: 150 documents; POLYCAB: 14 of 20 items). The other 11 companies were not reached. Re-running the same command resumes, because stored documents are skipped.
+
+What it showed:
+
+| Finding | Status |
+|---|---|
+| MPS memory grew to about 60 GB and every embedding call then failed (77 files). The MPS backend keeps memory per distinct batch shape and never frees it | **Fixed**: batches are padded to at most 15 fixed shapes on MPS; batch size capped by `MPS_MAX_BATCH_SIZE`; CPU fallback as a last resort. Memory then stayed flat |
+| No file failed for any other reason; duplicates, unsupported files, zip members and mislabelled files (an HTML page named `.zip`) were all handled as designed | Confirmed |
+| Scanned PDFs are slow: 2 to 12 minutes for the first parse on one CPU thread, then the whole document is converted again for the OCR pass | Open, see below |
+| A zip archive is one task, so its members are parsed one after another by a single worker. Six workers each sat inside one large archive while the others' files waited | Open, see below |
+| Killing the main process left worker processes alive. A worker inside a long docling call does not notice the parent is gone until that call returns | Open, see below |
+| Identical PDFs inside different archives were parsed by two workers at the same time; only one result is stored, the other is wasted work | Open, see below |
+| Throughput was very uneven: about 4 items a minute on small text files, close to zero while all workers were on scanned PDFs. A full run of this folder would take several hours | Measured, not tuned |
+| Worker memory stayed between 1 and 5 GB each with 6 workers | Measured |
+
+## 5. What is left
 
 ### Needs you or the LLM side
 
@@ -78,11 +100,22 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
   - very wide tables: a single row longer than `EMBED_MAX_SEQ_LENGTH` tokens is truncated at embedding;
   - heading levels from docling, which decide `section_path` and chunk boundaries.
   - table detection: in a synthetic test PDF docling did not recognise a table drawn without grid lines, and its cells arrived as loose paragraphs (kept as prose, not as a table). Check how real filings behave.
-- [ ] Measure memory per PDF worker on the M4 Pro and set `NUM_WORKERS` accordingly. Each PDF worker loads docling's layout and table models, and unified memory is shared with the MPS embedder.
-- [ ] Measure embedding throughput on MPS and tune `EMBED_BATCH_SIZE`.
+- [x] Memory per PDF worker on the M4 Pro: 1 to 5 GB each with 6 workers; the embedder holds about 13 GB of device memory at batch size 32. Six workers fit comfortably in 48 GB.
+- [ ] Finish the test-data run (11 companies and part of POLYCAB remain) and inspect the stored chunks with `view_db.py`.
+- [ ] Decide the OCR policy before a large load. Options: `ENABLE_ML_OCR=false`, a lower `MAX_PAGES_FOR_OCR`, or `TABLE_STRUCTURE_MODE=fast`. Scanned documents dominate the run time.
+- [ ] Measure embedding throughput on MPS in a real run. The stress test gave roughly 8 to 10 long texts per second with fixed shapes.
 - [ ] A small retrieval check (a handful of questions with known answers) to tune `CHUNK_SIZE_TOKENS` and `CHUNK_OVERLAP_TOKENS`.
 
-### Engineering follow-ups (not blocking)
+### Engineering follow-ups from the test run
+
+- [ ] **Orphaned workers.** When the main process is killed, workers busy in a parse keep running. Make them exit promptly: start the children in their own process group and kill the group from a signal handler in `main.py`, or have each worker run a small watchdog thread that calls `os._exit` when the parent disappears.
+- [ ] **Zip members in parallel.** Extract an archive in the main process (or a first pass) and queue each member as its own task, so one large archive does not occupy a single worker.
+- [ ] **OCR without a second full conversion.** The OCR pass re-converts the whole document; convert only the low-text pages, or decide per page in one pass.
+- [ ] **In-flight duplicates.** Let workers claim a `doc_id` with the main process before parsing, so identical files are not parsed twice in the same run.
+- [ ] **Parse speed.** Workers showed about 50% CPU each with `PARSER_THREADS=1`. Try fewer workers with more threads each, and `TABLE_STRUCTURE_MODE=fast`, and compare.
+- [ ] **Progress reporting.** A run prints nothing between start and finish except log lines; add a periodic "n of m files done" line.
+
+### Other engineering follow-ups (not blocking)
 
 - [ ] `is_known` in workers reads the table as it was when the worker started. Duplicates within a run are caught by the main process, so this is only wasted work, not a correctness issue.
 - [ ] Two runs at the same time against the same database and scratch directory are not supported: each clears the scratch directory and the ledger at start.
@@ -91,7 +124,7 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
 - [ ] `.github/workflows/pipeline-test.yml` has not run on GitHub yet; check the first run.
 - [ ] Merge `refactor/processor-only` into `main` once the real-data run is satisfactory.
 
-## 5. Definition of done
+## 6. Definition of done
 
 | Criterion | State |
 |---|---|
@@ -103,4 +136,4 @@ Decision 1 has a cost: record mode stores one vector per row. A price file with 
 | The same command runs unchanged on MPS, CUDA and CPU | Run with the real model on MPS (M4 Pro), inline and with workers. CUDA is covered only by the device-selection test |
 | No legacy module, legacy setting or `print` remains under `pipeline/` | Met |
 | Fast tests and `ruff` pass | Met locally; CI not yet observed |
-| Verified on real purchased data | **Not done.** Only a synthetic sample (a generated PDF, an HTML note, a 300-row price CSV) has been run end to end with the real model |
+| Verified on real purchased data | **Not done.** A partial run on scraped test data (164 documents, 4,015 chunks) completed without non-memory failures; see section 4. No purchased data has been run |

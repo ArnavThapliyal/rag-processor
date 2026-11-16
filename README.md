@@ -33,7 +33,7 @@ All pipeline stages are implemented and covered by tests.
 | LanceDB `documents` table (1024-dim, cosine, 50 financial columns), append-only | Done |
 | Multiprocessing: CPU parse/chunk workers and one embedding process | Done |
 
-Not yet done: a run over real purchased data, and tuning of chunk sizes against retrieval quality. See [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md).
+Not yet done: a run over real purchased data, and tuning of chunk sizes against retrieval quality. A first partial run on scraped test data is described in [NEXT_STEPS_PLAN.md](NEXT_STEPS_PLAN.md), section 4, together with what it showed about speed.
 
 ## Setup
 
@@ -61,6 +61,20 @@ uv run python main.py /path/to/data --workers 4 # number of parse/chunk processe
 - Running the same folder again is safe: files already in the table are skipped, not duplicated and not reported as failures.
 - The same file delivered under two paths is ingested once.
 - Logs go to stdout and `data/logs/pipeline.log`.
+
+### Inspecting the result
+
+```bash
+uv run python view_db.py                              # summary of the default database
+uv run python view_db.py /path/to/folder              # a database, or a folder that contains `lancedb/`
+uv run python view_db.py "closing price" --symbol POLYCAB   # semantic search, optionally filtered by symbol
+```
+
+To write the database somewhere other than `data/lancedb`, set `LANCEDB_PATH` for the run, for example `LANCEDB_PATH=/data/drop/lancedb uv run python main.py /data/drop`. The processor never ingests its own database folder.
+
+### How long a run takes
+
+Text files, spreadsheets and small PDFs take seconds each. Scanned PDFs take minutes each, because they are parsed on CPU and then converted a second time with OCR. If a delivery is mostly scans, consider `ENABLE_ML_OCR=false` or `TABLE_STRUCTURE_MODE=fast` (see configuration). A run can be stopped and started again; finished documents are skipped.
 
 ### What is skipped during discovery
 
