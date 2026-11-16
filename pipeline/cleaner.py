@@ -1,279 +1,140 @@
 """
-Purpose
-Normalizes parsed document content before chunking. The cleaner operates on
-the parser's intermediate representation (IR blocks), removes boilerplate,
-normalizes text, and preserves enough document structure for downstream
-chunking.
+Cleaner: remove boilerplate from the parser's blocks and normalise prose.
 
-Responsibilities
-- Remove repeated headers, footers, page numbers, and known boilerplate.
-- Normalize whitespace and text formatting.
-- Preserve semantic structure (headers, lists, tables) required by the
-  chunker.
+    blocks, removed = clean_blocks(parse_result.blocks, parse_result.page_count)
 
-In n out 
-- Takes in Parser IR blocks produced by parser.py.
-- Cleaned IR blocks.
-- Markdown-like text suitable for chunker.py.
+A pure function over schema.Block objects. Structure is preserved: page numbers
+stay on the blocks (never encoded into text), tables keep their TableData, and
+whitespace in tables, lists and code is left alone.
 
-Dependencies
-- parser.py defines the IR block schema consumed here.
-- chunker.py relies on preserved Markdown structure (headers, lists, etc.)
-  for document splitting.
+What is removed:
+  - blocks matching CLEAN_DENYLIST_PATTERNS ("Page 3 of 12", rule lines, ...);
+  - printed page numbers: a bare number that is the first or last block on its
+    page and either equals the page number or follows the same offset on several
+    pages. A bare number anywhere else is kept, because when table detection
+    fails the cells of a table arrive as loose numbers;
+  - running headers/footers: a short paragraph repeated on a large share of the
+    pages of a long document. Headings, tables, lists, captions, footnotes and
+    code are never removed this way, and neither are value-like cells ("Nil",
+    "N.A.", "12.5%") that legitimately repeat in financial filings.
 
-Notes
-This module performs document normalization only. It does not classify
-documents, generate embeddings, or write to the vector database.
+`removed` is a human-readable log of what was dropped, for the caller to record.
 """
-import json
-import re
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Set
-import logging
-from collections import Counter
 
-from config.settings import TRANS_DOCUMENTS, CLEANED_DOCUMENTS, TRANS_NUMERIC, CLEANED_NUMERIC
+from __future__ import annotations
+
+import logging
+import re
+from collections import defaultdict
+from dataclasses import replace
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from config.settings import (
+    CLEAN_DENYLIST_PATTERNS, CLEAN_MAX_BOILERPLATE_CHARS, CLEAN_MIN_PAGES_FOR_REPEAT,
+    CLEAN_REPEAT_PAGE_FRACTION,
+)
+from pipeline.schema import (
+    BLOCK_CAPTION, BLOCK_FOOTNOTE, BLOCK_HEADER, BLOCK_PARAGRAPH, BLOCK_TABLE, Block,
+)
 
 logger = logging.getLogger(__name__)
 
+# Whitespace is collapsed only in running text; tables, list items and code keep theirs.
+_PROSE_TYPES = frozenset({BLOCK_PARAGRAPH, BLOCK_HEADER, BLOCK_CAPTION, BLOCK_FOOTNOTE})
 
-class Cleaner:
-    DENYLIST_PATTERNS = [
-        "Scanned with CamScanner",
-        "Powered by",
-        "Confidential",
-        "Copyright",
-        "All rights reserved",
-        r"Page \d+ of \d+",   # Page X of Y pattern
-        r"^[._-]{5,}$",       # Lines with 5+ dashes/underscores/dots
-    ]
+_DENYLIST = [re.compile(p, re.IGNORECASE) for p in CLEAN_DENYLIST_PATTERNS]
+_BARE_PAGE_NUMBER = re.compile(r"[-–—\s]*(\d{1,4})[-–—\s]*")
+_MIN_PAGES_SHARING_OFFSET = 3
+# Digits, punctuation and currency only: a value, not a running header.
+_VALUE_LIKE = re.compile(r"[\s\d.,:%()+\-–—/₹$€£]*")
+_VALUE_WORDS = frozenset({"nil", "n.a.", "n.a", "na", "n/a", "none", "yes", "no", "total", "-do-", "ditto"})
+_MAX_LOGGED = 20
 
-    def __init__(self):
-        pass
 
-    def run(self, symbol: str, mode: str) -> Dict[str, Any]:
-        if mode == "numeric":
-            result = self._clean_numeric(symbol)
-        elif mode == "document":
-            result = self._clean_document(symbol)
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+def _is_value_like(text: str) -> bool:
+    return bool(_VALUE_LIKE.fullmatch(text)) or text.lower() in _VALUE_WORDS
 
-        logger.info(f"[cleaner] [{symbol}] mode={mode} — {result}")
-        return result
 
-    # ---- numeric mode -----------------------------------------------------
+def _repeated_boilerplate(blocks: Sequence[Block], page_count: Optional[int]) -> Set[str]:
+    """Short paragraphs that recur on enough pages to be a running header/footer."""
+    pages_seen = {b.page_number for b in blocks if b.page_number is not None}
+    total_pages = max(page_count or 0, len(pages_seen))
+    if total_pages < CLEAN_MIN_PAGES_FOR_REPEAT:
+        return set()
 
-    def _clean_numeric(self, symbol: str) -> Dict[str, Any]:
-        """Clean numeric data (OHLCV and fundamentals). [DEFERRED] from the active chain."""
-        input_path = TRANS_NUMERIC / f"{symbol}.json"
-        output_path = CLEANED_NUMERIC / f"{symbol}.json"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    pages_by_text: Dict[str, Set[int]] = defaultdict(set)
+    for block in blocks:
+        if block.type != BLOCK_PARAGRAPH or block.page_number is None:
+            continue
+        text = block.content.strip()
+        if not text or len(text) > CLEAN_MAX_BOILERPLATE_CHARS or _is_value_like(text):
+            continue
+        pages_by_text[text].add(block.page_number)
 
-        if not input_path.exists():
-            logger.warning(f"[cleaner] [{symbol}] numeric input not found: {input_path}")
-            return {"status": "no_data", "rows_cleaned": 0}
+    needed = max(3, CLEAN_REPEAT_PAGE_FRACTION * total_pages)
+    return {text for text, pages in pages_by_text.items() if len(pages) >= needed}
 
-        with open(input_path, 'r') as f:
-            data = json.load(f)
 
-        cleaned_ohlcv = []
-        seen_dates = set()
+def _printed_page_numbers(blocks: Sequence[Block]) -> Set[int]:
+    """Positions (indexes into blocks) of bare numbers that are printed page numbers."""
+    edges: Dict[int, List[int]] = {}  # page -> [index of its first block, index of its last block]
+    for position, block in enumerate(blocks):
+        if block.page_number is None:
+            continue
+        edge = edges.setdefault(block.page_number, [position, position])
+        edge[1] = position
 
-        if "ohlcv" in data and isinstance(data["ohlcv"], list):
-            for row in data["ohlcv"]:
-                if row.get("close") is None or row.get("close", 0) <= 0:
-                    continue
-                date_str = row.get("date")
-                if not date_str or not self._is_valid_date_format(date_str):
-                    continue
-                if date_str in seen_dates:
-                    continue
-                seen_dates.add(date_str)
-                cleaned_ohlcv.append(row)
+    candidates: List[Tuple[int, int]] = []  # (position, printed number - page number)
+    for page, (first, last) in edges.items():
+        for position in {first, last}:
+            block = blocks[position]
+            match = _BARE_PAGE_NUMBER.fullmatch(block.content.strip()) if block.type == BLOCK_PARAGRAPH else None
+            if match:
+                candidates.append((position, int(match.group(1)) - page))
 
-        cleaned_ohlcv.sort(key=lambda x: x.get("date", ""))
+    pages_per_offset: Dict[int, int] = defaultdict(int)
+    for _, offset in candidates:
+        pages_per_offset[offset] += 1
+    return {position for position, offset in candidates
+            if offset == 0 or pages_per_offset[offset] >= _MIN_PAGES_SHARING_OFFSET}
 
-        if "fundamentals" in data and isinstance(data["fundamentals"], dict):
-            for key, value in data["fundamentals"].items():
-                if value == 0:
-                    data["fundamentals"][key] = None
 
-        data["ohlcv"] = cleaned_ohlcv
+def clean_blocks(blocks: Sequence[Block], page_count: Optional[int] = None) -> Tuple[List[Block], List[str]]:
+    """Return (kept blocks, removal log). Input blocks are not modified."""
+    normalised: List[Block] = []
+    for block in blocks:
+        if block.type in _PROSE_TYPES:
+            block = replace(block, content=re.sub(r"\s+", " ", block.content or "").strip())
+        normalised.append(block)
 
-        with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
+    repeated = _repeated_boilerplate(normalised, page_count)
+    page_numbers = _printed_page_numbers(normalised)
+    kept: List[Block] = []
+    removed: Dict[str, int] = defaultdict(int)
 
-        return {"status": "success", "rows_cleaned": len(cleaned_ohlcv)}
-
-    # ---- document mode ------------------------------------------------
-
-    def _clean_document(self, symbol: str) -> Dict[str, Any]:
-        """Clean parsed document IR blocks and flatten to plain text for chunker.py."""
-        trans_dir = TRANS_DOCUMENTS / symbol
-        cleaned_dir = CLEANED_DOCUMENTS / symbol
-        cleaned_dir.mkdir(parents=True, exist_ok=True)
-
-        if not trans_dir.exists():
-            logger.warning(f"[cleaner] [{symbol}] no parsed input found at {trans_dir}")
-            return {"status": "no_data", "files_cleaned": 0}
-
-        files_cleaned = 0
-        for file_path in trans_dir.iterdir():
-            if file_path.is_file() and file_path.suffix == ".json":
-                self._clean_json_file(file_path, cleaned_dir)
-                files_cleaned += 1
-
-        if files_cleaned == 0:
-            logger.warning(f"[cleaner] [{symbol}] no JSON files found in {trans_dir}")
-            return {"status": "no_data", "files_cleaned": 0}
-
-        return {"status": "success", "files_cleaned": files_cleaned}
-
-    def _clean_json_file(self, file_path: Path, output_dir: Path) -> None:
-        """Clean a single parsed-IR-blocks JSON file and write it out as plain text."""
-        with open(file_path, 'r') as f:
-            ir_blocks = json.load(f)
-
-        cleaned_blocks = self.clean_ir_blocks(ir_blocks)
-        text = self.render_blocks_to_text(cleaned_blocks)
-
-        output_file = output_dir / f"{file_path.stem}.txt"
-        with open(output_file, 'w') as f:
-            f.write(text)
-
-    def render_blocks_to_text(self, blocks: List[Dict[str, Any]]) -> str:
-        """
-        Flattens IR blocks to a single Markdown-ish string for chunker.py.
-
-        Page boundaries used to be lost here — blocks carry `page_number`
-        (see _group_by_page) but the joined string is just prose, nothing
-        chunker.py could recover a page from. Now every page transition
-        emits a `[[PAGE:n]]` sentinel line ahead of that page's content.
-        chunker.py extracts these to compute each chunk's page_range and
-        strips them out before content is stored — see PAGE_MARKER_RE
-        there. Keep the sentinel format in sync between the two files.
-        """
-        lines = []
-        last_page = None
-        for block in blocks:
-            content = block.get('content', '')
-            if not (isinstance(content, str) and content.strip()):
+    for position, block in enumerate(normalised):
+        text = (block.content or "").strip()
+        if block.type == BLOCK_TABLE:
+            if block.table is not None or text:
+                kept.append(block)
+            continue
+        if not text:
+            continue
+        if block.type == BLOCK_PARAGRAPH:
+            if any(p.fullmatch(text) for p in _DENYLIST):
+                removed[f"denylist: {text}"] += 1
                 continue
+            if position in page_numbers:
+                removed["printed page number"] += 1
+                continue
+            if text in repeated:
+                removed[f"running header/footer: {text}"] += 1
+                continue
+        kept.append(block)
 
-            page_num = block.get('page_number', 1)
-            if page_num != last_page:
-                lines.append(f"[[PAGE:{page_num}]]")
-                last_page = page_num
-
-            block_type = block.get('type', 'paragraph')
-            stripped = content.strip()
-
-            if block_type == 'header':
-                level = block.get('hierarchical_level', 1) or 1
-                level = max(1, min(6, level))
-                lines.append(f"{'#' * level} {stripped}")
-            elif block_type == 'list_item':
-                lines.append(f"- {stripped}")
-            else:
-                lines.append(stripped)
-
-        return "\n\n".join(lines)
-
-    def clean_ir_blocks(self, ir_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        page_groups = self._group_by_page(ir_blocks)
-        dynamic_deletion_set = self._detect_dynamic_deletion_candidates(page_groups)
-        static_deletion_set = self._build_static_deletion_set()
-        regex_patterns = self._static_regex_patterns()
-        combined_deletion_set = dynamic_deletion_set.union(static_deletion_set)
-
-        cleaned_blocks = []
-        for block in ir_blocks:
-            content = block.get('content')
-            if isinstance(content, str):
-                stripped = content.strip()
-                if stripped in combined_deletion_set:
-                    continue
-                if any(pattern.fullmatch(stripped) for pattern in regex_patterns):
-                    continue
-
-            cleaned_block = self._normalize_block(block)
-            cleaned_blocks.append(cleaned_block)
-
-        return cleaned_blocks
-
-    def _group_by_page(self, ir_blocks: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
-        """Group all text blocks by their page_number attribute."""
-        page_groups = {}
-        for block in ir_blocks:
-            page_num = block.get('page_number', 1)
-            if page_num not in page_groups:
-                page_groups[page_num] = []
-            page_groups[page_num].append(block)
-        return page_groups
-
-    def _detect_dynamic_deletion_candidates(self, page_groups: Dict[int, List[Dict[str, Any]]]) -> Set[str]:
-        """Detect and tag headers, footers, and page-numbered text using frequency analysis."""
-        short_blocks = []
-        for page_num, blocks in page_groups.items():
-            for block in blocks:
-                if (block.get('type') in ['paragraph', 'header'] and
-                        isinstance(block.get('content'), str) and
-                        len(block['content']) < 80):
-                    short_blocks.append(block)
-
-        string_page_count = Counter()
-        string_to_pages: Dict[str, Set[int]] = {}
-
-        for block in short_blocks:
-            content = block.get('content', '').strip()
-            if content:
-                string_page_count[content] += 1
-                string_to_pages.setdefault(content, set()).add(block.get('page_number', 1))
-
-        deletion_set = set()
-        threshold = 3  # minimum number of distinct pages for being flagged
-
-        for text, page_set in string_to_pages.items():
-            if len(page_set) >= threshold:
-                deletion_set.add(text)
-
-        logger.info(f"Detected {len(deletion_set)} dynamic deletion candidates")
-        return deletion_set
-
-    def _build_static_deletion_set(self) -> Set[str]:
-        """Literal (non-regex) denylist entries — matched via exact block-content equality."""
-        return {p for p in self.DENYLIST_PATTERNS if not self._is_regex_pattern(p)}
-
-    def _static_regex_patterns(self) -> List[re.Pattern]:
-        """Regex denylist entries, compiled once, matched separately via fullmatch()."""
-        return [re.compile(p) for p in self.DENYLIST_PATTERNS if self._is_regex_pattern(p)]
-
-    @staticmethod
-    def _is_regex_pattern(pattern: str) -> bool:
-        return bool(re.search(r'[.*+?^${}()|[\]\\]', pattern))
-
-    def _normalize_block(self, block: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize text content in a block, preserving table structures."""
-        normalized_block = block.copy()
-
-        if (isinstance(normalized_block.get('content'), str) and
-                normalized_block.get('type') != 'table'):
-            content = normalized_block['content']
-            normalized_content = re.sub(r'\s+', ' ', content).strip()
-            normalized_block['content'] = normalized_content
-
-        return normalized_block
-
-    def _is_valid_date_format(self, date_str: str) -> bool:
-        """Validate that a date string parses as YYYY-MM-DD."""
-        if not isinstance(date_str, str):
-            return False
-        try:
-            if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
-                return False
-            datetime.strptime(date_str, '%Y-%m-%d')
-            return True
-        except ValueError:
-            return False
+    log = [f"{what} (x{count})" for what, count in list(removed.items())[:_MAX_LOGGED]]
+    if len(removed) > _MAX_LOGGED:
+        log.append(f"... and {len(removed) - _MAX_LOGGED} more distinct removals")
+    if removed:
+        logger.info(f"cleaner removed {sum(removed.values())} block(s): {'; '.join(log)}")
+    return kept, log

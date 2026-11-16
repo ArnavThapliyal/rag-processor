@@ -1,161 +1,122 @@
 #!/usr/bin/env python3
 """
-Pipeline orchestration logic.
+Pipeline orchestration.
 
-PipelineRunner does exactly three things, nothing else:
-    1. Run the appropriate stage modules, in order, for each symbol.
-    2. Log every stage start/end, every symbol, every status.
-    3. Validate the metadata dict each stage's run() call returns.
+    PipelineRunner().run(root)
 
-It has zero knowledge of *how* a stage does its job — that logic lives in the
-stage's own module. If a comment in this file ever explains *how* a stage
-does its job, that comment is wrong and belongs in that stage's module
-instead.
+`root` is any directory (or a single file). It is crawled recursively with
+Path.rglob and every file found is handed to the indexer. There is no required
+layout: folder names and depth are ignored, and what a file *is* comes only from
+type_router's content sniffing. The one place the tree matters is locating
+optional metadata files (see metadata.py), and those are never ingested.
 
-ACTIVE CHAIN (STAGE_ORDER):
-    document_crawler -> index
-
-    Down from seven stages to two. type_router, parser, cleaner, chunker,
-    and embedder used to each be an independent stage writing its own
-    directory for the next one to read — data/transient/, data/cleaned/,
-    data/chunked/, data/embedded/. All of that is gone. pipeline/indexer.py
-    now does route -> parse -> clean -> chunk -> embed -> upsert as one
-    in-memory call per file; the intermediate directories only existed to
-    hand data between process boundaries that no longer exist. See
-    indexer.py's module docstring for why this also makes each file's
-    indexing atomic without any explicit rollback machinery.
-
-    document_crawler stays a separate stage deliberately — it's slow,
-    network-bound, and rate-limited against BSE/NSE/screener.in. You want
-    to be able to re-run indexing (e.g. after tuning chunk_size or
-    switching embedding models) without re-hitting those sites.
-
-    Normalizer is intentionally excluded from STAGE_ORDER this pass —
-    [DEFERRED], not removed.
-
-    Numeric collection/cleaning is intentionally excluded this pass —
-    [DEFERRED], not removed.
+Acquisition (crawling, collectors) is out of scope: the data is purchased and
+arrives as static files.
 
 FAILURE MODEL:
-    Symbol-level: document_crawler failing for a symbol skips index for
-    that symbol (nothing to index yet) and marks the symbol failed. Within
-    index, failure is per FILE — indexer.py's index_symbol() already
-    isolates one bad file from the rest of the symbol's files (see its
-    docstring); a symbol only gets marked failed here if the index stage
-    itself raises, which happens when index_symbol()'s own bookkeeping
-    breaks, not when an individual document fails to parse (that's
-    files_failed in the returned metadata, still a "success" status for
-    the symbol as a whole if at least one file made it in).
-
-METADATA CONTRACT: [CONFIRM]
-    Each stage's run(symbol) is expected to eventually return a dict shaped
-    roughly like {"status": "success" | "skipped" | "no_data", ...}. That
-    contract isn't locked in against the real stage modules yet, so
-    _normalize_stage_result() tolerates a stage returning None or something
-    non-dict rather than crashing on it.
-
-TAG LEGEND:
-    [MISSING]  - functionality not implemented yet, flagged rather than faked
-    [DEFERRED] - module exists, intentionally not in the active chain this pass
-    [CONFIRM]  - verify against the real module's interface once finalized
+    Per-file. The indexer isolates each file, so one bad file never stops the
+    rest; failures are reported in the summary (files_failed / failed_files) and
+    main.py exits non-zero when there are any.
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from pipeline.Retrieval.Document.document_crawler import run as run_document_crawler
+from config.settings import LANCEDB_PATH, LOG_DIR, SCRATCH_DIR
 from pipeline.indexer import Indexer
-from pipeline.normalizer import Normalizer  # instantiated, not wired into STAGE_ORDER — [DEFERRED]
+from pipeline.metadata import is_metadata_file
+from pipeline.type_router import HANDLER_UNSUPPORTED, open_routed
 
 logger = logging.getLogger(__name__)
 
-# Single source of truth for stage names. main.py imports this directly for
-# --stage's argparse choices, so the CLI and the runner can never drift into
-# two different stage taxonomies again.
-STAGE_ORDER = [
-    "document_crawler",
-    "index",
-]
+_COUNTER_KEYS = ("files_indexed", "files_failed", "files_skipped", "chunks_written")
+# Our own working directories are never input, even when the root is the data dir.
+_WORK_DIRS = (SCRATCH_DIR, LOG_DIR, LANCEDB_PATH)
+
+
+def discover_files(root: Path) -> List[Path]:
+    """
+    Every candidate file under `root`, sorted for a deterministic run order.
+
+    Skipped: hidden files and anything inside a hidden directory (.DS_Store,
+    ._x, .git), symlinks (avoids double-ingesting the same bytes), sidecar/batch
+    metadata files, and the pipeline's own working directories.
+    """
+    root = Path(root)
+    if root.is_file():
+        return [root]
+
+    work = [d.resolve() for d in _WORK_DIRS]
+    files: List[Path] = []
+    for path in root.rglob("*"):
+        rel_parts = path.relative_to(root).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        if is_metadata_file(path):
+            continue
+        resolved = path.resolve()
+        if any(d == resolved or d in resolved.parents for d in work):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def dry_run(root: Path) -> Dict[str, Any]:
+    """
+    Discover and route only: what a run would process, by detected type, and
+    what it would skip and why. Nothing is parsed, embedded or written.
+    """
+    root = Path(root)
+    files = discover_files(root)
+    by_type: Counter = Counter()
+    unsupported: Counter = Counter()
+    errors: List[str] = []
+    for path in files:
+        try:
+            with open_routed(path, SCRATCH_DIR) as routed:
+                for item in routed:
+                    if item.handler == HANDLER_UNSUPPORTED:
+                        unsupported[item.reason or "unsupported"] += 1
+                    else:
+                        by_type[item.source_type] += 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return {"root": str(root), "files_found": len(files), "by_source_type": dict(by_type),
+            "unsupported": dict(unsupported), "routing_errors": errors}
 
 
 class PipelineRunner:
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.config = config or {}
+    def __init__(self, workers: Optional[int] = None, indexer: Optional[Any] = None) -> None:
+        self._indexer = indexer if indexer is not None else Indexer(workers=workers)
 
-        self._indexer = Indexer()
-        self._normalizer = Normalizer()  # [DEFERRED] instantiated, not called from run()
+    def run(self, root: Path) -> Dict[str, Any]:
+        root = Path(root)
+        files = discover_files(root)
+        logger.info(f"Starting pipeline: {len(files)} file(s) under {root}")
 
-        self._stage_fns: Dict[str, Callable[[str], Any]] = {
-            "document_crawler": self._call_document_crawler,
-            "index": self._call_index,
+        base = root if root.is_dir() else root.parent
+        result = self._validate_result(self._indexer.index_files(files, base))
+
+        summary = {
+            **result,
+            "root": str(root),
+            "files_found": len(files),
+            **{key: int(result.get(key, 0) or 0) for key in _COUNTER_KEYS},
+            "failed_files": list(result.get("failed_files", [])),
         }
-
-    # ---- stage adapters -----------------------------------------------
-
-    def _call_document_crawler(self, symbol: str) -> Any:
-        return run_document_crawler(symbol)
-
-    def _call_index(self, symbol: str) -> Any:
-        return self._indexer.index_symbol(symbol)
-
-    # ---- core run loop --------------------------------------------------
-
-    def run(self, symbols: List[str], stage: Optional[str] = None) -> Dict[str, Any]:
-        if stage is not None and stage not in STAGE_ORDER:
-            raise ValueError(f"Unknown stage {stage!r}. Must be one of {STAGE_ORDER}")
-
-        stages_to_run = [stage] if stage else list(STAGE_ORDER)
-        logger.info(f"Starting pipeline for {len(symbols)} symbol(s) — stages: {stages_to_run}")
-
-        succeeded: List[str] = []
-        failed: List[str] = []
-
-        for symbol in symbols:
-            logger.info(f"[Pipeline] [{symbol}] starting")
-            symbol_failed = False
-
-            for stage_name in stages_to_run:
-                logger.info(f"[{stage_name}] [{symbol}] starting")
-                try:
-                    raw_result = self._stage_fns[stage_name](symbol)
-                    metadata = self._normalize_stage_result(raw_result)
-                    self._validate_metadata(stage_name, symbol, metadata)
-                    logger.info(f"[{stage_name}] [{symbol}] completed: {metadata}")
-                except Exception as exc:
-                    logger.error(f"[{stage_name}] [{symbol}] failed: {exc}", exc_info=True)
-                    symbol_failed = True
-                    break  # downstream stages depend on this one's output — no point continuing
-
-            if symbol_failed:
-                logger.error(f"[Pipeline] [{symbol}] aborted — see failed stage above")
-                failed.append(symbol)
-            else:
-                logger.info(f"[Pipeline] [{symbol}] completed successfully")
-                succeeded.append(symbol)
-
-        logger.info(
-            f"Pipeline run complete: {len(succeeded)} succeeded, "
-            f"{len(failed)} failed, out of {len(symbols)}"
-        )
-        return {"total": len(symbols), "succeeded": succeeded, "failed": failed}
-
-    # ---- metadata handling ------------------------------------------------
+        logger.info(f"Pipeline run complete: {summary}")
+        return summary
 
     @staticmethod
-    def _normalize_stage_result(raw: Any) -> Dict[str, Any]:
-        if raw is None:
-            # [CONFIRM] stage returned nothing — assumed success since no exception was raised.
-            return {"status": "success"}
-        if isinstance(raw, dict):
-            return raw
-        # [CONFIRM] stage returned a non-dict — wrapping rather than dropping it.
-        return {"status": "success", "raw_result": raw}
-
-    @staticmethod
-    def _validate_metadata(stage_name: str, symbol: str, metadata: Dict[str, Any]) -> None:
-        """[CONFIRM] Minimal shape check until each stage's real return contract is locked in."""
-        if "status" not in metadata:
-            logger.warning(f"[{stage_name}] [{symbol}] metadata missing 'status' key: {metadata}")
-        elif metadata["status"] not in ("success", "skipped", "no_data"):
-            logger.warning(f"[{stage_name}] [{symbol}] unexpected status value: {metadata['status']!r}")
+    def _validate_result(raw: Any) -> Dict[str, Any]:
+        """A malformed indexer result is an error, not a silent success."""
+        if not isinstance(raw, dict):
+            raise ValueError(f"indexer returned {type(raw).__name__}, expected dict")
+        if raw.get("status") not in ("success", "skipped", "no_data"):
+            raise ValueError(f"indexer returned invalid status {raw.get('status')!r}")
+        return raw

@@ -1,162 +1,124 @@
 #!/usr/bin/env python3
 """
-Entry point for the data harvester pipeline.
+Entry point for the RAG processor: ingest purchased files into LanceDB.
 
-Exactly three supported invocations — nothing else:
+    main.py [ROOT] [--workers N] [--dry-run]
 
-    main.py --all-symbols                  # every symbol, every stage
-    main.py --symbol SYM                   # one symbol, every stage
-    main.py --symbol SYM --stage STAGE     # one symbol, exactly one stage
+ROOT is any directory (default: config.settings.INPUT_DIR), or a single file.
+It is crawled recursively; there is no required folder structure and folder
+names are ignored. File types are detected from content by pipeline/type_router.
+Optional metadata files (*.meta.json, metadata.json, manifest.json) are read
+for vendor metadata and are never ingested themselves.
 
---stage is only valid alongside --symbol; there is no "all symbols, one
-stage" mode in this pass. Add it deliberately later if you need it — don't
-let it appear as an accidental side effect of argparse defaults.
-
-Symbol source of truth: config/company_urls.json (produced by
-scripts/url_discovery.py). A symbol must have an entry there before it can
-be processed — that's what --all-symbols enumerates, and what --symbol is
-validated against.
+Parsing and chunking run in worker processes; one separate process owns the
+embedding model. Because processes are started with 'spawn', everything that
+runs must stay under the `if __name__ == "__main__"` guard at the bottom.
 """
 
 import sys
-import json
-import time
+import uuid
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
-from config.settings import COMPANY_URLS_JSON
-from pipeline.pipeline import PipelineRunner, STAGE_ORDER
+from config.logsetup import setup_logging
+from config.settings import INPUT_DIR, NUM_WORKERS, ensure_dirs
 
 logger = logging.getLogger(__name__)
 
-
-def setup_logging() -> None:
-    """
-    Configure the ROOT logger once, in one place.
-
-    Every module's `logging.getLogger(__name__)` — main.py, pipeline.py, and
-    every stage module — propagates up to root by default, so attaching
-    handlers here (via basicConfig) is enough for all of them. The previous
-    version attached handlers to logging.getLogger("__main__") specifically,
-    which pipeline.py's logger never propagated into — its INFO-level logs
-    were silently going nowhere.
-    """
-    Path("data").mkdir(exist_ok=True)
-
-    log_formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s")
-    log_formatter.converter = time.gmtime  # UTC timestamps
-
-    file_handler = logging.FileHandler("data/pipeline.log")
-    file_handler.setFormatter(log_formatter)
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(log_formatter)
-
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stdout_handler])
-
-
-def load_known_symbols() -> List[str]:
-    """Every symbol with a discovered-URL entry in company_urls.json."""
-    if not COMPANY_URLS_JSON.exists():
-        print(f"Error: {COMPANY_URLS_JSON} not found. Run scripts/url_discovery.py first.")
-        sys.exit(1)
-    try:
-        with open(COMPANY_URLS_JSON, "r") as f:
-            company_urls = json.load(f)
-    except Exception as e:
-        print(f"Error reading {COMPANY_URLS_JSON}: {e}")
-        sys.exit(1)
-    return list(company_urls.keys())
+_MAX_FAILED_LISTED = 20
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Data Harvester Pipeline",
-        epilog=(
-            "examples:\n"
-            "  %(prog)s --all-symbols\n"
-            "  %(prog)s --symbol name\n"
-            "  %(prog)s --symbol name --stage index\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument(
-        "--all-symbols",
-        action="store_true",
-        help="Process every symbol in company_urls.json, running all stages.",
-    )
-    selection.add_argument(
-        "--symbol",
-        type=str,
-        metavar="SYM",
-        help="Process a single symbol.",
-    )
-
+    parser = argparse.ArgumentParser(description="RAG processor: ingest purchased documents into LanceDB")
     parser.add_argument(
-        "--stage",
-        type=str,
-        choices=STAGE_ORDER,
-        default=None,
-        metavar="STAGE",
-        help=f"Run exactly one stage instead of the full chain. Requires --symbol. "
-             f"One of: {', '.join(STAGE_ORDER)}.",
+        "root",
+        nargs="?",
+        type=Path,
+        default=INPUT_DIR,
+        help=f"Directory to crawl recursively, or a single file (default: {INPUT_DIR}).",
     )
-
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Parse/chunk worker processes (default: NUM_WORKERS = {NUM_WORKERS}). 0 runs everything in one process.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only discover and detect file types; report what would be processed. Nothing is written.",
+    )
     args = parser.parse_args()
-
-    if args.stage and args.all_symbols:
-        parser.error("--stage can only be combined with --symbol, not --all-symbols.")
-
+    if args.workers is not None and args.workers < 0:
+        parser.error("--workers must be 0 or more")
     return args
 
 
 def print_summary(summary: Dict[str, Any]) -> None:
     print(
-        f"\n{summary['total']} symbol(s) processed: "
-        f"{len(summary['succeeded'])} succeeded, {len(summary['failed'])} failed."
+        f"\n{summary['files_found']} file(s) found under {summary['root']}: "
+        f"{summary['files_indexed']} indexed, {summary['files_failed']} failed, "
+        f"{summary['files_skipped']} skipped | chunks written: {summary['chunks_written']}"
     )
-    if summary["failed"]:
-        print("Failed: " + ", ".join(summary["failed"]))
+    if summary.get("by_status"):
+        print("By status: " + ", ".join(f"{k}: {v}" for k, v in summary["by_status"].items()))
+    if summary.get("by_source_type"):
+        print("Indexed by type: " + ", ".join(f"{k}: {v}" for k, v in sorted(summary["by_source_type"].items())))
+    if summary.get("finalize_error"):
+        print(f"Index finalisation failed (rows are stored): {summary['finalize_error']}")
+    failed = summary["failed_files"]
+    if failed:
+        shown = ", ".join(failed[:_MAX_FAILED_LISTED])
+        more = f" (+{len(failed) - _MAX_FAILED_LISTED} more)" if len(failed) > _MAX_FAILED_LISTED else ""
+        print(f"Failed: {shown}{more}")
+    if summary.get("run_id"):
+        print(f"Run id: {summary['run_id']}")
+
+
+def print_dry_run(report: Dict[str, Any]) -> None:
+    print(f"\n{report['files_found']} file(s) found under {report['root']} (dry run, nothing written)")
+    for source_type, count in sorted(report["by_source_type"].items()):
+        print(f"  would process  {source_type}: {count}")
+    for reason, count in sorted(report["unsupported"].items()):
+        print(f"  would skip     {count} x {reason}")
+    for error in report["routing_errors"]:
+        print(f"  routing error  {error}")
 
 
 def main() -> None:
-    setup_logging()
-    args = parse_args()
-
-    known_symbols = load_known_symbols()
-    runner = PipelineRunner()
-    
-    if args.all_symbols:
-        symbols = known_symbols
-        stage: Optional[str] = None
-        logger.info(f"Mode: all symbols, all stages ({len(symbols)} symbols)")
-    else:
-        if args.symbol not in known_symbols:
-            print(f"Error: '{args.symbol}' not found in {COMPANY_URLS_JSON}. "
-                  f"Run scripts/url_discovery.py or check the symbol spelling.")
-            sys.exit(1)
-        symbols = [args.symbol]
-        stage = args.stage
-        if stage:
-            logger.info(f"Mode: single symbol, single stage ({args.symbol} / {stage})")
-        else:
-            logger.info(f"Mode: single symbol, all stages ({args.symbol})")
+    args = parse_args()  # first, so --help and bad flags have no filesystem side effects
+    if not args.root.exists():
+        print(f"Error: {args.root} does not exist.")
+        sys.exit(1)
 
     try:
-        summary = runner.run(symbols, stage=stage)
+        from pipeline.indexer import Indexer
+        from pipeline.pipeline import PipelineRunner, dry_run
+    except ImportError as exc:
+        hint = " Install the libmagic system library (macOS: brew install libmagic)." if "magic" in str(exc).lower() else ""
+        print(f"Error: cannot start the pipeline: {exc}.{hint}")
+        sys.exit(1)
+
+    ensure_dirs()
+    run_id = uuid.uuid4().hex[:12]
+    setup_logging(run_id)
+
+    try:
+        if args.dry_run:
+            print_dry_run(dry_run(args.root))
+            sys.exit(0)
+        summary = PipelineRunner(indexer=Indexer(workers=args.workers, run_id=run_id)).run(args.root)
     except KeyboardInterrupt:
         logger.info("Pipeline interrupted by user")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Pipeline failed to start: {e}", exc_info=True)
+        logger.error(f"Pipeline failed: {e}", exc_info=True)
         sys.exit(1)
 
     print_summary(summary)
-    sys.exit(0 if not summary["failed"] else 1)
+    sys.exit(1 if summary["files_failed"] or summary.get("finalize_error") else 0)
 
 
 if __name__ == "__main__":
